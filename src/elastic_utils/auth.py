@@ -3,6 +3,7 @@
 import click
 import httpx
 from rich.console import Console
+from rich.markup import escape
 
 from .config import (
     delete_credentials,
@@ -12,6 +13,23 @@ from .config import (
 )
 
 console = Console()
+
+
+def _handle_http_error(
+    error: httpx.HTTPStatusError,
+    custom_messages: dict[int, str] | None = None,
+) -> None:
+    """Handle HTTP error with optional custom messages per status code."""
+    custom_messages = custom_messages or {}
+    status_code = error.response.status_code
+
+    if status_code in custom_messages:
+        console.print(f"[red]{custom_messages[status_code]}[/red]")
+    else:
+        console.print(
+            f"[red]HTTP error {status_code}:[/red] {escape(error.response.text)}"
+        )
+    raise SystemExit(1)
 
 
 @click.group()
@@ -50,15 +68,9 @@ def login(url: str, username: str, password: str) -> None:
         console.print(f"[red]Connection error:[/red] {e}")
         raise SystemExit(1)
     except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            console.print(
-                "[red]Authentication failed:[/red] Invalid username or password"
-            )
-        else:
-            console.print(
-                f"[red]HTTP error {e.response.status_code}:[/red] {e.response.text}"
-            )
-        raise SystemExit(1)
+        _handle_http_error(
+            e, {401: "Authentication failed: Invalid username or password"}
+        )
 
     data = response.json()
     api_key_id = data["id"]

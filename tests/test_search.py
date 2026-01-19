@@ -88,7 +88,7 @@ def test_search_submit_with_query_file(
         },
     }
 
-    with patch("elastic_utils.search.httpx.post", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(
             cli,
             [
@@ -118,7 +118,7 @@ def test_search_submit_with_stdin(runner: CliRunner, authenticated_creds: Path) 
         },
     }
 
-    with patch("elastic_utils.search.httpx.post", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(
             cli,
             ["search", "submit", "--index", "test-index"],
@@ -154,7 +154,7 @@ def test_search_status_not_found(runner: CliRunner, authenticated_creds: Path) -
         "Not found", request=MagicMock(), response=mock_response
     )
 
-    with patch("elastic_utils.search.httpx.get", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(cli, ["search", "status", "nonexistent-id"])
 
     assert result.exit_code == 1
@@ -175,7 +175,7 @@ def test_search_status_success(runner: CliRunner, authenticated_creds: Path) -> 
         },
     }
 
-    with patch("elastic_utils.search.httpx.get", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(cli, ["search", "status", "test-id"])
 
     assert result.exit_code == 0
@@ -203,7 +203,7 @@ def test_search_get_jsonl_output(
 
     output_file = tmp_path / "output.jsonl"
 
-    with patch("elastic_utils.search.httpx.get", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(
             cli, ["search", "get", "test-id", "--output", str(output_file)]
         )
@@ -231,7 +231,7 @@ def test_search_get_json_output(runner: CliRunner, authenticated_creds: Path) ->
         },
     }
 
-    with patch("elastic_utils.search.httpx.get", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(cli, ["search", "get", "test-id", "--format", "json"])
 
     assert result.exit_code == 0
@@ -245,7 +245,7 @@ def test_search_delete_success(runner: CliRunner, authenticated_creds: Path) -> 
     """Test delete command success."""
     mock_response = MagicMock()
 
-    with patch("elastic_utils.search.httpx.delete", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(cli, ["search", "delete", "test-id"])
 
     assert result.exit_code == 0
@@ -260,7 +260,7 @@ def test_search_delete_not_found(runner: CliRunner, authenticated_creds: Path) -
         "Not found", request=MagicMock(), response=mock_response
     )
 
-    with patch("elastic_utils.search.httpx.delete", return_value=mock_response):
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
         result = runner.invoke(cli, ["search", "delete", "nonexistent-id"])
 
     assert result.exit_code == 0
@@ -294,7 +294,7 @@ def test_search_wait_success(runner: CliRunner, authenticated_creds: Path) -> No
     }
 
     with patch(
-        "elastic_utils.search.httpx.get",
+        "elastic_utils.client.httpx.request",
         side_effect=[running_response, complete_response],
     ):
         with patch("elastic_utils.search.time.sleep"):  # Skip actual waiting
@@ -308,8 +308,8 @@ def test_search_wait_success(runner: CliRunner, authenticated_creds: Path) -> No
 
 def test_search_connection_error(runner: CliRunner, authenticated_creds: Path) -> None:
     """Test handling of connection errors."""
-    with patch("elastic_utils.search.httpx.get") as mock_get:
-        mock_get.side_effect = httpx.ConnectError("Connection refused")
+    with patch("elastic_utils.client.httpx.request") as mock_request:
+        mock_request.side_effect = httpx.ConnectError("Connection refused")
 
         result = runner.invoke(cli, ["search", "status", "test-id"])
 

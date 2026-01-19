@@ -1,6 +1,5 @@
 """Search commands for Elasticsearch async search and export."""
 
-import base64
 import json
 import sys
 import time
@@ -8,31 +7,13 @@ from pathlib import Path
 from typing import Any
 
 import click
-import httpx
 from rich.console import Console
-from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from .config import load_credentials
+from .client import ElasticsearchClient
+from .formatting import format_hits, format_shards, write_output
 
 console = Console()
-
-
-def get_auth() -> tuple[str, dict[str, str]]:
-    """Get authentication credentials. Returns (url, headers dict with Authorization)."""
-    creds = load_credentials()
-    if creds is None:
-        console.print("[yellow]Not authenticated.[/yellow]")
-        console.print("Run [bold]elastic-utils auth login[/bold] to authenticate.")
-        raise SystemExit(1)
-
-    # Elasticsearch API key auth requires base64 encoding of "id:api_key"
-    api_key_id = creds["api_key_id"]
-    api_key = creds["api_key"]
-    encoded = base64.b64encode(f"{api_key_id}:{api_key}".encode()).decode()
-    headers = {"Authorization": f"ApiKey {encoded}"}
-
-    return creds["url"], headers
 
 
 def read_query(query_file: Path | None) -> dict[str, Any]:
@@ -57,15 +38,6 @@ def read_query(query_file: Path | None) -> dict[str, Any]:
     except json.JSONDecodeError as e:
         console.print(f"[red]Invalid JSON:[/red] {e}")
         raise SystemExit(1)
-
-
-def format_shards(shards: dict[str, Any]) -> str:
-    """Format shard progress info."""
-    total = shards.get("total", 0)
-    successful = shards.get("successful", 0)
-    skipped = shards.get("skipped", 0)
-    failed = shards.get("failed", 0)
-    return f"{successful}/{total} (skipped: {skipped}, failed: {failed})"
 
 
 @click.group()
@@ -97,44 +69,20 @@ def search() -> None:
 )
 def submit(index: str, query_file: Path | None, wait_for: str, keep_alive: str) -> None:
     """Submit an async search and return the search ID."""
-    url, headers = get_auth()
+    client = ElasticsearchClient.from_credentials(console)
     query = read_query(query_file)
 
     console.print(f"Submitting async search to [bold]{index}[/bold]...")
 
-    try:
-        response = httpx.post(
-            f"{url}/{index}/_async_search",
-            params={
-                "wait_for_completion_timeout": wait_for,
-                "keep_on_completion": "true",
-                "keep_alive": keep_alive,
-            },
-            headers=headers,
-            json=query,
-            timeout=60.0,
-        )
-        response.raise_for_status()
-    except httpx.ConnectError as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as e:
-        console.print(
-            f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-        )
-        raise SystemExit(1)
-
-    data = response.json()
-    search_id = data.get("id")
-    is_running = data.get("is_running", False)
-    is_partial = data.get("is_partial", False)
-    shards = data.get("response", {}).get("_shards", {})
+    result = client.async_search_submit(
+        index, query, wait_for=wait_for, keep_alive=keep_alive
+    )
 
     console.print("[green]Search submitted![/green]")
-    console.print(f"  Search ID: [bold]{search_id}[/bold]")
-    console.print(f"  Running: {is_running}")
-    console.print(f"  Partial: {is_partial}")
-    console.print(f"  Shards: {format_shards(shards)}")
+    console.print(f"  Search ID: [bold]{result.id}[/bold]")
+    console.print(f"  Running: {result.is_running}")
+    console.print(f"  Partial: {result.is_partial}")
+    console.print(f"  Shards: {format_shards(result.response.shards)}")
 
 
 @search.command()
@@ -146,47 +94,18 @@ def submit(index: str, query_file: Path | None, wait_for: str, keep_alive: str) 
 )
 def status(search_id: str, wait_for: str | None) -> None:
     """Check the status of an async search."""
-    url, headers = get_auth()
+    client = ElasticsearchClient.from_credentials(console)
 
-    params = {}
-    if wait_for:
-        params["wait_for_completion_timeout"] = wait_for
+    result = client.async_search_status(search_id, wait_for=wait_for)
 
-    try:
-        response = httpx.get(
-            f"{url}/_async_search/{search_id}",
-            params=params,
-            headers=headers,
-            timeout=120.0,
-        )
-        response.raise_for_status()
-    except httpx.ConnectError as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            console.print("[red]Search not found.[/red]")
-        else:
-            console.print(
-                f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-            )
-        raise SystemExit(1)
-
-    data = response.json()
-    is_running = data.get("is_running", False)
-    is_partial = data.get("is_partial", False)
-    shards = data.get("response", {}).get("_shards", {})
-    took = data.get("response", {}).get("took", 0)
-    hits_total = len(data.get("response", {}).get("hits", {}).get("hits", []))
-
-    status_color = "yellow" if is_running else "green"
+    status_color = "yellow" if result.is_running else "green"
     console.print(
-        f"[{status_color}]Status: {'Running' if is_running else 'Complete'}[/{status_color}]"
+        f"[{status_color}]Status: {'Running' if result.is_running else 'Complete'}[/{status_color}]"
     )
-    console.print(f"  Partial: {is_partial}")
-    console.print(f"  Shards: {format_shards(shards)}")
-    console.print(f"  Took: {took}ms")
-    console.print(f"  Hits returned: {hits_total}")
+    console.print(f"  Partial: {result.is_partial}")
+    console.print(f"  Shards: {format_shards(result.response.shards)}")
+    console.print(f"  Took: {result.response.took}ms")
+    console.print(f"  Hits returned: {result.total_hits}")
 
 
 @search.command()
@@ -205,7 +124,7 @@ def status(search_id: str, wait_for: str | None) -> None:
 )
 def wait(search_id: str, interval: int, timeout: int | None) -> None:
     """Wait for an async search to complete, showing progress."""
-    url, headers = get_auth()
+    client = ElasticsearchClient.from_credentials(console)
 
     start_time = time.time()
 
@@ -217,35 +136,16 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
         task = progress.add_task("Waiting for search to complete...", total=None)
 
         while True:
-            try:
-                response = httpx.get(
-                    f"{url}/_async_search/{search_id}",
-                    headers=headers,
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-            except httpx.ConnectError as e:
-                console.print(f"[red]Connection error:[/red] {e}")
-                raise SystemExit(1)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    console.print("[red]Search not found.[/red]")
-                else:
-                    console.print(
-                        f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-                    )
-                raise SystemExit(1)
-
-            data = response.json()
-            is_running = data.get("is_running", False)
-            shards = data.get("response", {}).get("_shards", {})
+            result = client.async_search_poll(search_id)
+            if result is None:
+                break
 
             progress.update(
                 task,
-                description=f"Shards: {format_shards(shards)} | Elapsed: {int(time.time() - start_time)}s",
+                description=f"Shards: {format_shards(result.response.shards)} | Elapsed: {int(time.time() - start_time)}s",
             )
 
-            if not is_running:
+            if not result.is_running:
                 break
 
             if timeout and (time.time() - start_time) >= timeout:
@@ -254,14 +154,12 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
 
             time.sleep(interval)
 
-    # Final status
-    took = data.get("response", {}).get("took", 0)
-    hits_total = len(data.get("response", {}).get("hits", {}).get("hits", []))
-
-    console.print("[green]Search complete![/green]")
-    console.print(f"  Shards: {format_shards(shards)}")
-    console.print(f"  Took: {took}ms")
-    console.print(f"  Hits returned: {hits_total}")
+    # Final status (result is from last poll)
+    if result:
+        console.print("[green]Search complete![/green]")
+        console.print(f"  Shards: {format_shards(result.response.shards)}")
+        console.print(f"  Took: {result.response.took}ms")
+        console.print(f"  Hits returned: {result.total_hits}")
 
 
 @search.command()
@@ -281,70 +179,31 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
 )
 def get(search_id: str, output: Path | None, output_format: str) -> None:
     """Get the results of an async search."""
-    url, headers = get_auth()
+    client = ElasticsearchClient.from_credentials(console)
 
-    try:
-        response = httpx.get(
-            f"{url}/_async_search/{search_id}",
-            headers=headers,
-            timeout=120.0,
-        )
-        response.raise_for_status()
-    except httpx.ConnectError as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            console.print("[red]Search not found.[/red]")
-        else:
-            console.print(
-                f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-            )
-        raise SystemExit(1)
+    result = client.async_search_status(search_id)
 
-    data = response.json()
-    hits = data.get("response", {}).get("hits", {}).get("hits", [])
-
-    if output_format == "json":
-        result = json.dumps(hits, indent=2)
-    else:  # jsonl
-        result = "\n".join(json.dumps(hit) for hit in hits)
-
-    if output:
-        output.write_text(result)
-        console.print(f"[green]Wrote {len(hits)} hits to {output}[/green]")
-    else:
-        print(result)
+    formatted = format_hits(result.hits, output_format)
+    write_output(
+        formatted,
+        output,
+        console,
+        success_message=f"[green]Wrote {result.total_hits} hits to {output}[/green]"
+        if output
+        else None,
+    )
 
 
 @search.command()
 @click.argument("search_id")
 def delete(search_id: str) -> None:
     """Delete an async search."""
-    url, headers = get_auth()
+    client = ElasticsearchClient.from_credentials(console)
 
-    try:
-        response = httpx.delete(
-            f"{url}/_async_search/{search_id}",
-            headers=headers,
-            timeout=30.0,
-        )
-        response.raise_for_status()
-    except httpx.ConnectError as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            console.print(
-                "[yellow]Search not found (may have already expired).[/yellow]"
-            )
-            return
-        console.print(
-            f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-        )
-        raise SystemExit(1)
+    deleted = client.async_search_delete(search_id, warn_not_found=True)
 
-    console.print("[green]Search deleted.[/green]")
+    if deleted:
+        console.print("[green]Search deleted.[/green]")
 
 
 @search.command()
@@ -401,7 +260,7 @@ def export(
     to_date: str | None,
 ) -> None:
     """Export all search results using async search + PIT pagination."""
-    url, headers = get_auth()
+    client = ElasticsearchClient.from_credentials(console)
     query = read_query(query_file)
 
     # Add time range filter if specified
@@ -429,187 +288,104 @@ def export(
 
     console.print(f"[bold]Starting export from {index}[/bold]")
 
-    # Step 1: Run async search to verify query works on frozen indices
-    console.print("Running initial async search...")
-    try:
-        response = httpx.post(
-            f"{url}/{index}/_async_search",
-            params={
-                "wait_for_completion_timeout": "1s",
-                "keep_on_completion": "true",
-                "keep_alive": "1h",
-            },
-            headers=headers,
-            json=query,
-            timeout=60.0,
+    # Use session for connection pooling during multi-request export
+    with client.session():
+        # Step 1: Run async search to verify query works on frozen indices
+        console.print("Running initial async search...")
+        initial_result = client.async_search_submit(
+            index, query, wait_for="1s", keep_alive="1h"
         )
-        response.raise_for_status()
-    except httpx.ConnectError as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as e:
+        async_search_id = initial_result.id
+
+        # Step 2: Wait for async search to complete
+        console.print("Waiting for async search to complete...")
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Processing...", total=None)
+
+            while True:
+                result = client.async_search_poll(async_search_id)
+                if result is None:
+                    break
+
+                progress.update(
+                    task, description=f"Shards: {format_shards(result.response.shards)}"
+                )
+
+                if not result.is_running:
+                    break
+
+                time.sleep(5)
+
+        initial_hits = result.hits if result else []
         console.print(
-            f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
+            f"Initial search complete, got {len(initial_hits)} hits in first page"
         )
-        raise SystemExit(1)
 
-    data = response.json()
-    async_search_id = data.get("id")
+        # Cleanup async search
+        client.async_search_delete(async_search_id, silent=True)
 
-    # Step 2: Wait for async search to complete
-    console.print("Waiting for async search to complete...")
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Processing...", total=None)
+        # Step 3: Open PIT for pagination
+        console.print("Opening Point-in-Time for pagination...")
+        pit_id = client.open_pit(index, keep_alive=keep_alive)
 
-        while True:
-            try:
-                response = httpx.get(
-                    f"{url}/_async_search/{async_search_id}",
-                    headers=headers,
-                    timeout=30.0,
-                )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                console.print(
-                    f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-                )
-                raise SystemExit(1)
+        # Step 4: Paginate through all results
+        all_hits: list[dict[str, Any]] = []
+        search_after = None
+        page = 0
 
-            data = response.json()
-            is_running = data.get("is_running", False)
-            shards = data.get("response", {}).get("_shards", {})
+        # Prepare query for PIT search (add _shard_doc tiebreaker for pagination)
+        pit_query = query.copy()
+        pit_query["pit"] = {"id": pit_id, "keep_alive": keep_alive}
+        # Add _shard_doc tiebreaker for efficient pagination with PIT
+        pit_query["sort"] = query.get("sort", [{"@timestamp": "asc"}]) + [
+            {"_shard_doc": "asc"}
+        ]
 
-            progress.update(task, description=f"Shards: {format_shards(shards)}")
+        console.print("Fetching all pages...")
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Fetching...", total=None)
 
-            if not is_running:
-                break
+                while True:
+                    page += 1
+                    if search_after:
+                        pit_query["search_after"] = search_after
 
-            time.sleep(5)
-
-    initial_hits = data.get("response", {}).get("hits", {}).get("hits", [])
-    console.print(
-        f"Initial search complete, got {len(initial_hits)} hits in first page"
-    )
-
-    # Cleanup async search
-    try:
-        httpx.delete(
-            f"{url}/_async_search/{async_search_id}",
-            headers=headers,
-            timeout=30.0,
-        )
-    except httpx.HTTPStatusError:
-        pass  # Ignore cleanup errors
-
-    # Step 3: Open PIT for pagination
-    console.print("Opening Point-in-Time for pagination...")
-    try:
-        response = httpx.post(
-            f"{url}/{index}/_pit",
-            params={"keep_alive": keep_alive},
-            headers=headers,
-            timeout=60.0,
-        )
-        response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        console.print(
-            f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-        )
-        raise SystemExit(1)
-
-    pit_id = response.json().get("id")
-
-    # Step 4: Paginate through all results
-    all_hits: list[dict[str, Any]] = []
-    search_after = None
-    page = 0
-
-    # Prepare query for PIT search (add _shard_doc tiebreaker for pagination)
-    pit_query = query.copy()
-    pit_query["pit"] = {"id": pit_id, "keep_alive": keep_alive}
-    # Add _shard_doc tiebreaker for efficient pagination with PIT
-    pit_query["sort"] = query.get("sort", [{"@timestamp": "asc"}]) + [
-        {"_shard_doc": "asc"}
-    ]
-
-    console.print("Fetching all pages...")
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Fetching...", total=None)
-
-        while True:
-            page += 1
-            if search_after:
-                pit_query["search_after"] = search_after
-
-            progress.update(
-                task, description=f"Page {page} | Total docs: {len(all_hits)}"
-            )
-
-            try:
-                response = httpx.post(
-                    f"{url}/_search",
-                    headers=headers,
-                    json=pit_query,
-                    timeout=120.0,
-                )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                console.print(
-                    f"[red]HTTP error {e.response.status_code}:[/red] {escape(e.response.text)}"
-                )
-                # Cleanup PIT on error
-                try:
-                    httpx.request(
-                        "DELETE",
-                        f"{url}/_pit",
-                        headers=headers,
-                        json={"id": pit_id},
-                        timeout=30.0,
+                    progress.update(
+                        task, description=f"Page {page} | Total docs: {len(all_hits)}"
                     )
-                except httpx.HTTPStatusError:
-                    pass
-                raise SystemExit(1)
 
-            hits = response.json().get("hits", {}).get("hits", [])
-            if not hits:
-                break
+                    search_result = client.search_with_pit(pit_query)
+                    hits = search_result.hit_list
 
-            all_hits.extend(hits)
-            search_after = hits[-1].get("sort")
+                    if not hits:
+                        break
 
-            # Refresh PIT keep-alive
-            pit_query["pit"]["id"] = response.json().get("pit_id", pit_id)
+                    all_hits.extend(hits)
+                    search_after = hits[-1].get("sort")
 
-    # Step 5: Close PIT
-    try:
-        httpx.request(
-            "DELETE",
-            f"{url}/_pit",
-            headers=headers,
-            json={"id": pit_id},
-            timeout=30.0,
-        )
-    except httpx.HTTPStatusError:
-        pass  # Ignore cleanup errors
+                    # Refresh PIT keep-alive
+                    if search_result.pit_id:
+                        pit_query["pit"]["id"] = search_result.pit_id
+        finally:
+            # Step 5: Close PIT
+            client.close_pit(pit_id)
 
     console.print(f"[green]Export complete! Total documents: {len(all_hits)}[/green]")
 
     # Write output
-    if output_format == "json":
-        result = json.dumps(all_hits, indent=2)
-    else:  # jsonl
-        result = "\n".join(json.dumps(hit) for hit in all_hits)
-
-    if output:
-        output.write_text(result)
-        console.print(f"Wrote to {output}")
-    else:
-        print(result)
+    formatted = format_hits(all_hits, output_format)
+    write_output(
+        formatted,
+        output,
+        console,
+        success_message=f"Wrote to {output}" if output else None,
+    )

@@ -8,6 +8,9 @@ src/elastic_utils/
 ├── cli.py           # Click CLI groups
 ├── auth.py          # Auth commands (login/logout/status)
 ├── search.py        # Async search commands (submit/status/wait/get/delete/export)
+├── client.py        # ElasticsearchClient class with error handling
+├── models.py        # Pydantic response models
+├── formatting.py    # Output formatting utilities
 └── config.py        # Credential storage (XDG data dir)
 
 tests/
