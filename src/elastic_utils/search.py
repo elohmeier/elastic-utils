@@ -12,6 +12,7 @@ from rich.progress import (
     BarColumn,
     Progress,
     SpinnerColumn,
+    TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -198,12 +199,13 @@ def get(search_id: str, output: Path | None, output_format: str) -> None:
 
     result = client.async_search_status(search_id)
 
-    formatted = format_hits(result.hits, output_format)
+    hits = result.hits
+    formatted = format_hits(hits, output_format)
     write_output(
         formatted,
         output,
         console,
-        success_message=f"[green]Wrote {result.total_hits} hits to {output}[/green]"
+        success_message=f"[green]Wrote {len(hits)} hits to {output}[/green]"
         if output
         else None,
     )
@@ -344,10 +346,8 @@ def export(
 
                 time.sleep(5)
 
-        initial_hits = result.hits if result else []
-        console.print(
-            f"Initial search complete, got {len(initial_hits)} hits in first page"
-        )
+        total_docs = result.total_hits if result else 0
+        console.print(f"Initial search complete, total matching docs: {total_docs:,}")
 
         # Cleanup async search
         client.async_search_delete(async_search_id, silent=True)
@@ -360,6 +360,7 @@ def export(
         all_hits: list[dict[str, Any]] = []
         search_after = None
         page = 0
+        docs_written = 0
 
         # Prepare query for PIT search (add _shard_doc tiebreaker for pagination)
         pit_query = query.copy()
@@ -369,23 +370,33 @@ def export(
             {"_shard_doc": "asc"}
         ]
 
+        # Open file for streaming writes (JSONL only)
+        output_file = None
+        if output and output_format == "jsonl":
+            output_file = open(output, "w")  # noqa: SIM115
+
         console.print("Fetching all pages...")
         try:
             with Progress(
                 SpinnerColumn(),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("•"),
                 TextColumn("[progress.description]{task.description}"),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("eta"),
+                TimeRemainingColumn(),
                 console=console,
             ) as progress:
-                task = progress.add_task("Fetching...", total=None)
+                task = progress.add_task(
+                    "Starting...", total=total_docs if total_docs > 0 else None
+                )
 
                 while True:
                     page += 1
                     if search_after:
                         pit_query["search_after"] = search_after
-
-                    progress.update(
-                        task, description=f"Page {page} | Total docs: {len(all_hits)}"
-                    )
 
                     search_result = client.search_with_pit(pit_query)
                     hits = search_result.hit_list
@@ -393,23 +404,44 @@ def export(
                     if not hits:
                         break
 
-                    all_hits.extend(hits)
+                    # Stream write for JSONL format
+                    if output_file:
+                        for hit in hits:
+                            output_file.write(json.dumps(hit) + "\n")
+                        output_file.flush()
+                        docs_written += len(hits)
+                    else:
+                        all_hits.extend(hits)
+
+                    current_count = docs_written if output_file else len(all_hits)
+                    progress.update(
+                        task,
+                        completed=current_count,
+                        description=f"Page {page} • {current_count:,} docs",
+                    )
+
                     search_after = hits[-1].get("sort")
 
                     # Refresh PIT keep-alive
                     if search_result.pit_id:
                         pit_query["pit"]["id"] = search_result.pit_id
         finally:
-            # Step 5: Close PIT
+            # Step 5: Close PIT and output file
             client.close_pit(pit_id)
+            if output_file:
+                output_file.close()
 
-    console.print(f"[green]Export complete! Total documents: {len(all_hits)}[/green]")
+    final_count = docs_written if docs_written > 0 else len(all_hits)
+    console.print(f"[green]Export complete! Total documents: {final_count:,}[/green]")
 
-    # Write output
-    formatted = format_hits(all_hits, output_format)
-    write_output(
-        formatted,
-        output,
-        console,
-        success_message=f"Wrote to {output}" if output else None,
-    )
+    # Write output (only if not already streamed)
+    if not (output and output_format == "jsonl"):
+        formatted = format_hits(all_hits, output_format)
+        write_output(
+            formatted,
+            output,
+            console,
+            success_message=f"Wrote to {output}" if output else None,
+        )
+    elif output:
+        console.print(f"Wrote to {output}")

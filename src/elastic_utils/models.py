@@ -20,6 +20,13 @@ class HitsContainer(BaseModel):
     hits: list[dict[str, Any]] = Field(default_factory=list)
     total: dict[str, Any] | int = 0
 
+    @property
+    def total_count(self) -> int:
+        """Get the total document count."""
+        if isinstance(self.total, dict):
+            return self.total.get("value", 0)
+        return self.total
+
 
 class ResponseBody(BaseModel):
     """Inner response body from async search."""
@@ -46,8 +53,8 @@ class AsyncSearchResponse(BaseModel):
 
     @property
     def total_hits(self) -> int:
-        """Get the number of hits returned."""
-        return len(self.hits)
+        """Get the total number of matching documents."""
+        return self.response.hits.total_count
 
 
 class PITResponse(BaseModel):
