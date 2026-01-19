@@ -332,3 +332,86 @@ class ElasticsearchClient:
         )
         assert response is not None
         return SearchResponse.model_validate(response.json())
+
+    # Diagnostic operations
+
+    def cluster_info(self) -> dict[str, Any]:
+        """Get cluster info including version."""
+        response = self.get("/")
+        assert response is not None
+        return response.json()
+
+    def cat_indices(
+        self,
+        pattern: str | None = None,
+        *,
+        sort: str = "creation.date",
+        headers: str = "index,health,status,docs.count,store.size,creation.date",
+    ) -> list[dict[str, Any]]:
+        """List indices using _cat/indices API."""
+        path = f"/_cat/indices/{pattern}" if pattern else "/_cat/indices"
+        response = self.get(
+            path,
+            params={"format": "json", "s": sort, "h": headers},
+        )
+        assert response is not None
+        return response.json()
+
+    def cat_aliases(
+        self,
+        pattern: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List aliases using _cat/aliases API."""
+        path = f"/_cat/aliases/{pattern}" if pattern else "/_cat/aliases"
+        response = self.get(
+            path,
+            params={"format": "json"},
+        )
+        assert response is not None
+        return response.json()
+
+    def get_alias(self, alias: str) -> dict[str, Any]:
+        """Get alias details including member indices."""
+        response = self.get(f"/{alias}/_alias")
+        assert response is not None
+        return response.json()
+
+    def get_index_settings(
+        self,
+        index: str,
+        setting: str | None = None,
+    ) -> dict[str, Any]:
+        """Get index settings."""
+        path = f"/{index}/_settings/{setting}" if setting else f"/{index}/_settings"
+        response = self.get(path)
+        assert response is not None
+        return response.json()
+
+    def ilm_explain(self, index_pattern: str) -> dict[str, Any]:
+        """Get ILM status for indices."""
+        response = self.get(f"/{index_pattern}/_ilm/explain")
+        assert response is not None
+        return response.json()
+
+    def get_date_range(
+        self,
+        index: str,
+        field: str = "@timestamp",
+    ) -> tuple[str | None, str | None]:
+        """Get min/max date range for a timestamp field."""
+        response = self.post(
+            f"/{index}/_search",
+            json={
+                "size": 0,
+                "aggs": {
+                    "min_date": {"min": {"field": field}},
+                    "max_date": {"max": {"field": field}},
+                },
+            },
+        )
+        assert response is not None
+        data = response.json()
+        aggs = data.get("aggregations", {})
+        min_val = aggs.get("min_date", {}).get("value_as_string")
+        max_val = aggs.get("max_date", {}).get("value_as_string")
+        return min_val, max_val

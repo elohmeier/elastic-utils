@@ -106,6 +106,55 @@ elastic-utils search export --index alias-frozen --query-file query.json \
 }
 ```
 
+## Diagnostic Commands
+
+Kubectl-style commands for inspecting Elasticsearch resources.
+
+### Cluster version
+
+```bash
+elastic-utils version          # Show cluster version
+elastic-utils version -o json  # Output as JSON
+```
+
+### List indices
+
+```bash
+elastic-utils get indices                    # List all indices
+elastic-utils get indices 'logs-*'           # Filter by pattern
+elastic-utils get indices '*frozen*'         # Find frozen indices
+elastic-utils get indices -o wide            # Show additional columns (shards, replicas)
+elastic-utils get indices -o json            # Output as JSON
+elastic-utils get indices --sort docs.count  # Sort by document count
+```
+
+### List aliases
+
+```bash
+elastic-utils get aliases             # List all aliases
+elastic-utils get aliases 'logs-*'    # Filter by pattern
+elastic-utils get aliases -o json     # Output as JSON
+```
+
+### Describe index
+
+Shows detailed information including settings, ILM status, and date range.
+
+```bash
+elastic-utils describe index my-index
+elastic-utils describe index my-index -o json
+elastic-utils describe index my-index --timestamp-field event.timestamp
+```
+
+### Describe alias
+
+Shows member indices, date range across all indices, and ILM status.
+
+```bash
+elastic-utils describe alias logs-frozen
+elastic-utils describe alias logs-frozen -o json
+```
+
 ## Development
 
 ```bash

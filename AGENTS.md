@@ -8,6 +8,9 @@ src/elastic_utils/
 ├── cli.py           # Click CLI groups
 ├── auth.py          # Auth commands (login/logout/status)
 ├── search.py        # Async search commands (submit/status/wait/get/delete/export)
+├── get.py           # List commands (get indices/aliases)
+├── describe.py      # Detail commands (describe index/alias)
+├── version.py       # Cluster version command
 ├── client.py        # ElasticsearchClient class with error handling
 ├── models.py        # Pydantic response models
 ├── formatting.py    # Output formatting utilities
@@ -17,6 +20,9 @@ tests/
 ├── conftest.py      # Elasticsearch fixture with security enabled
 ├── test_auth.py     # Auth command tests (uses real ES via Docker)
 ├── test_search.py   # Search command tests
+├── test_get.py      # Get command tests
+├── test_describe.py # Describe command tests
+├── test_version.py  # Version command tests
 └── test_config.py   # Config unit tests
 ```
 

@@ -3,7 +3,10 @@
 import rich_click as click
 
 from .auth import auth
+from .describe import describe
+from .get import get
 from .search import search
+from .version import version
 
 click.rich_click.TEXT_MARKUP = "rich"
 
@@ -16,4 +19,7 @@ def cli() -> None:
 
 
 cli.add_command(auth)
+cli.add_command(describe)
+cli.add_command(get)
 cli.add_command(search)
+cli.add_command(version)
