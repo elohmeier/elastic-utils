@@ -7,11 +7,13 @@ src/elastic_utils/
 ├── __init__.py      # Entry point, exports main()
 ├── cli.py           # Click CLI groups
 ├── auth.py          # Auth commands (login/logout/status)
+├── search.py        # Async search commands (submit/status/wait/get/delete/export)
 └── config.py        # Credential storage (XDG data dir)
 
 tests/
 ├── conftest.py      # Elasticsearch fixture with security enabled
 ├── test_auth.py     # Auth command tests (uses real ES via Docker)
+├── test_search.py   # Search command tests
 └── test_config.py   # Config unit tests
 ```
 
@@ -23,6 +25,7 @@ uv run pytest             # Run tests (requires Docker)
 uv run elastic-utils      # Run CLI
 ruff format .             # Format code
 ruff check --fix .        # Lint and fix
+ty check .                # Type check
 ```
 
 ## Testing

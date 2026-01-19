@@ -3,6 +3,7 @@
 import rich_click as click
 
 from .auth import auth
+from .search import search
 
 click.rich_click.TEXT_MARKUP = "rich"
 
@@ -15,3 +16,4 @@ def cli() -> None:
 
 
 cli.add_command(auth)
+cli.add_command(search)
