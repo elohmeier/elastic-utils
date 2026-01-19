@@ -48,14 +48,12 @@ function formatCellValue(value: unknown): string {
   }
   if (typeof value === "object") {
     // Handle BigInt in JSON stringify
-    const str = JSON.stringify(
+    return JSON.stringify(
       value,
       (_, v) => (typeof v === "bigint" ? v.toString() : v),
     );
-    return str.length > 100 ? str.slice(0, 100) + "..." : str;
   }
-  const str = String(value);
-  return str.length > 100 ? str.slice(0, 100) + "..." : str;
+  return String(value);
 }
 
 // Get the value from the row using the result column name
@@ -77,7 +75,6 @@ function getRowValue(row: Record<string, unknown>, path: string): unknown {
           >
             <div class="flex items-center gap-1">
               <span
-                class="truncate max-w-[200px]"
                 title={pathToDisplayName(columnPath)}
               >
                 {pathToDisplayName(columnPath)}
@@ -108,7 +105,7 @@ function getRowValue(row: Record<string, unknown>, path: string): unknown {
             {/if}
           </Table.Cell>
           {#each visibleColumns as columnPath}
-            <Table.Cell class="max-w-xs truncate">
+            <Table.Cell>
               {formatCellValue(getRowValue(row, columnPath))}
             </Table.Cell>
           {/each}
