@@ -74,9 +74,7 @@ function getRowValue(row: Record<string, unknown>, path: string): unknown {
             onclick={() => onSort(columnPath)}
           >
             <div class="flex items-center gap-1">
-              <span
-                title={pathToDisplayName(columnPath)}
-              >
+              <span title={pathToDisplayName(columnPath)}>
                 {pathToDisplayName(columnPath)}
               </span>
               {#if sortColumn === columnPath}
@@ -105,7 +103,7 @@ function getRowValue(row: Record<string, unknown>, path: string): unknown {
             {/if}
           </Table.Cell>
           {#each visibleColumns as columnPath}
-            <Table.Cell>
+            <Table.Cell class="whitespace-pre-wrap break-words align-top">
               {formatCellValue(getRowValue(row, columnPath))}
             </Table.Cell>
           {/each}

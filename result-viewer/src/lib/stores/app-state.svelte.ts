@@ -1,4 +1,5 @@
 import type { FieldSchema, LoadedFile } from "$lib/services/file-loader";
+import { buildFieldTree, flattenFieldTree } from "$lib/services/schema-parser";
 
 export interface Filter {
   id: string;
@@ -112,17 +113,40 @@ function createAppState() {
         state.timeRange.field = `"${timestampField.name}"`;
       }
 
-      // Set default visible columns - prefer non-STRUCT leaf fields
-      // For Elasticsearch exports, show _index, _id, and some _source fields
+      // Set default visible columns
+      // For Elasticsearch exports, prioritize _source.@timestamp and _source.message
+      const fieldTree = buildFieldTree(file.schema);
+      const allLeafFields = flattenFieldTree(fieldTree);
+
       const defaultColumns: string[] = [];
-      for (const field of file.schema) {
-        if (!field.type.toUpperCase().startsWith("STRUCT")) {
-          // Simple field - use quoted name
-          defaultColumns.push(`"${field.name}"`);
-        }
+
+      // Look for timestamp field in _source
+      const sourceTimestampField = allLeafFields.find(
+        (f) => f.displayPath === "_source.@timestamp",
+      );
+      if (sourceTimestampField) {
+        defaultColumns.push(sourceTimestampField.path);
       }
-      // Limit to first 6 non-struct fields
-      state.visibleColumns = defaultColumns.slice(0, 6);
+
+      // Look for message field in _source
+      const messageField = allLeafFields.find(
+        (f) => f.displayPath === "_source.message",
+      );
+      if (messageField) {
+        defaultColumns.push(messageField.path);
+      }
+
+      // If no preferred fields found, fall back to first 6 non-struct fields
+      if (defaultColumns.length === 0) {
+        for (const field of file.schema) {
+          if (!field.type.toUpperCase().startsWith("STRUCT")) {
+            defaultColumns.push(`"${field.name}"`);
+          }
+        }
+        state.visibleColumns = defaultColumns.slice(0, 6);
+      } else {
+        state.visibleColumns = defaultColumns;
+      }
 
       state.offset = 0;
       state.selectedRowIndex = null;

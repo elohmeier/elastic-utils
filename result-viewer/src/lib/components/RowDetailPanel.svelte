@@ -131,8 +131,8 @@ const tokenizedData = $derived(data ? tokenize(data) : []);
 </script>
 
 {#if data}
-  <div class="bg-muted/30 border-t p-4">
-    <div class="mb-2 flex items-center justify-between">
+  <div class="bg-muted/30 flex h-full flex-col border-t p-4">
+    <div class="mb-2 flex shrink-0 items-center justify-between">
       <h3 class="text-sm font-medium">Document Details</h3>
       <div class="flex items-center gap-2">
         <Button variant="outline" size="sm" onclick={copyToClipboard}>
@@ -149,7 +149,7 @@ const tokenizedData = $derived(data ? tokenize(data) : []);
         </Button>
       </div>
     </div>
-    <pre class="bg-background max-h-96 overflow-auto rounded border p-4 text-xs font-mono leading-relaxed">{#each tokenizedData as line}{#each line as token}<span class="json-{token.type}">{token.value}</span>{/each}
+    <pre class="bg-background flex-1 overflow-auto rounded border p-4 text-xs font-mono leading-relaxed">{#each tokenizedData as line}{#each line as token}<span class="json-{token.type}">{token.value}</span>{/each}
 {/each}</pre>
   </div>
 {/if}

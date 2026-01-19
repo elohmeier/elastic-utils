@@ -9,6 +9,7 @@ import RowDetailPanel from "$lib/components/RowDetailPanel.svelte";
 import StatusBar from "$lib/components/StatusBar.svelte";
 import TimeRangePicker from "$lib/components/TimeRangePicker.svelte";
 import { Button } from "$lib/components/ui/button";
+import * as Resizable from "$lib/components/ui/resizable";
 import {
   getRowById,
   loadJSONLFile,
@@ -218,79 +219,96 @@ function handleCloseFile() {
     </div>
   {:else}
     <!-- Main viewer -->
-    <div class="flex flex-1 overflow-hidden">
+    <Resizable.PaneGroup direction="horizontal" class="flex-1">
       <!-- Sidebar -->
-      <div class="w-64 shrink-0 overflow-hidden">
-        <FieldSidebar
-          fields={appState.state.loadedFile.schema}
-          visibleColumns={appState.state.visibleColumns}
-          onToggleColumn={(col) => {
-            appState.toggleColumn(col);
-            refreshData();
-          }}
-          onAddFilter={handleAddFilter}
-        />
-      </div>
+      <Resizable.Pane defaultSize={20} minSize={10} maxSize={40}>
+        <div class="h-full overflow-hidden">
+          <FieldSidebar
+            fields={appState.state.loadedFile.schema}
+            visibleColumns={appState.state.visibleColumns}
+            onToggleColumn={(col) => {
+              appState.toggleColumn(col);
+              refreshData();
+            }}
+            onAddFilter={handleAddFilter}
+          />
+        </div>
+      </Resizable.Pane>
+
+      <Resizable.Handle withHandle />
 
       <!-- Main content -->
-      <div class="flex flex-1 flex-col overflow-hidden">
-        <!-- Query controls -->
-        <div class="space-y-2 border-b p-4">
-          <QueryBar
-            value={appState.state.searchQuery}
-            onSearch={handleSearch}
-          />
+      <Resizable.Pane defaultSize={80}>
+        <Resizable.PaneGroup direction="vertical" class="h-full">
+          <!-- Data area -->
+          <Resizable.Pane
+            defaultSize={appState.state.expandedRowData ? 60 : 100}
+            minSize={30}
+          >
+            <div class="flex h-full flex-col overflow-hidden">
+              <!-- Query controls -->
+              <div class="space-y-2 border-b p-4">
+                <QueryBar
+                  value={appState.state.searchQuery}
+                  onSearch={handleSearch}
+                />
 
-          <TimeRangePicker
-            from={appState.state.timeRange.from}
-            to={appState.state.timeRange.to}
-            field={appState.state.timeRange.field}
-            onFieldChange={handleTimeRangeFieldChange}
-            onChange={handleTimeRangeChange}
-            schema={appState.state.loadedFile.schema}
-          />
+                <TimeRangePicker
+                  from={appState.state.timeRange.from}
+                  to={appState.state.timeRange.to}
+                  field={appState.state.timeRange.field}
+                  onFieldChange={handleTimeRangeFieldChange}
+                  onChange={handleTimeRangeChange}
+                  schema={appState.state.loadedFile.schema}
+                />
 
-          <FilterBar
-            filters={appState.state.filters}
-            onRemove={handleRemoveFilter}
-            onClearAll={handleClearFilters}
-          />
-        </div>
+                <FilterBar
+                  filters={appState.state.filters}
+                  onRemove={handleRemoveFilter}
+                  onClearAll={handleClearFilters}
+                />
+              </div>
 
-        <!-- Data table -->
-        <div class="flex-1 overflow-auto p-4">
-          <DataTable
-            data={tableData}
-            visibleColumns={appState.state.visibleColumns}
-            sortColumn={appState.state.sortColumn}
-            sortDirection={appState.state.sortDirection}
-            onSort={handleSort}
-            onRowClick={handleRowClick}
-            selectedRowIndex={appState.state.selectedRowIndex}
-          />
-        </div>
+              <!-- Data table -->
+              <div class="flex-1 overflow-auto p-4">
+                <DataTable
+                  data={tableData}
+                  visibleColumns={appState.state.visibleColumns}
+                  sortColumn={appState.state.sortColumn}
+                  sortDirection={appState.state.sortDirection}
+                  onSort={handleSort}
+                  onRowClick={handleRowClick}
+                  selectedRowIndex={appState.state.selectedRowIndex}
+                />
+              </div>
 
-        <!-- Row detail panel -->
-        {#if appState.state.expandedRowData}
-          <RowDetailPanel
-            data={appState.state.expandedRowData}
-            onClose={() => {
-              appState.setSelectedRow(null);
-              appState.setExpandedRowData(null);
-            }}
-          />
-        {/if}
+              <!-- Pagination -->
+              <Pagination
+                offset={appState.state.offset}
+                limit={appState.state.limit}
+                total={appState.state.filteredRows}
+                onPageChange={handlePageChange}
+                onLimitChange={handleLimitChange}
+              />
+            </div>
+          </Resizable.Pane>
 
-        <!-- Pagination -->
-        <Pagination
-          offset={appState.state.offset}
-          limit={appState.state.limit}
-          total={appState.state.filteredRows}
-          onPageChange={handlePageChange}
-          onLimitChange={handleLimitChange}
-        />
-      </div>
-    </div>
+          <!-- Row detail panel -->
+          {#if appState.state.expandedRowData}
+            <Resizable.Handle withHandle />
+            <Resizable.Pane defaultSize={40} minSize={15} maxSize={70}>
+              <RowDetailPanel
+                data={appState.state.expandedRowData}
+                onClose={() => {
+                  appState.setSelectedRow(null);
+                  appState.setExpandedRowData(null);
+                }}
+              />
+            </Resizable.Pane>
+          {/if}
+        </Resizable.PaneGroup>
+      </Resizable.Pane>
+    </Resizable.PaneGroup>
 
     <!-- Status bar -->
     <StatusBar
