@@ -91,9 +91,9 @@ def index(name: str, output: str, timestamp_field: str) -> None:
 
     if output == "json":
         result = {
-            "index": cat_data[0] if cat_data else {},
+            "index": cat_data[0].model_dump(by_alias=True) if cat_data else {},
             "settings": settings,
-            "ilm": ilm_data,
+            "ilm": ilm_data.model_dump(),
             "date_range": {"min": min_date, "max": max_date},
         }
         console.print(json.dumps(result, indent=2))
@@ -106,8 +106,8 @@ def index(name: str, output: str, timestamp_field: str) -> None:
     idx = cat_data[0]
 
     # Basic info
-    console.print(f"[bold]Name:[/bold]         {idx.get('index', name)}")
-    health = idx.get("health", "")
+    console.print(f"[bold]Name:[/bold]         {idx.index or name}")
+    health = idx.health or ""
     health_style = {"green": "green", "yellow": "yellow", "red": "red"}.get(health, "")
     if health_style:
         console.print(
@@ -115,13 +115,13 @@ def index(name: str, output: str, timestamp_field: str) -> None:
         )
     else:
         console.print(f"[bold]Health:[/bold]       {health}")
-    console.print(f"[bold]Status:[/bold]       {idx.get('status', '-')}")
-    console.print(f"[bold]Docs:[/bold]         {idx.get('docs.count', '-')}")
-    console.print(f"[bold]Size:[/bold]         {idx.get('store.size', '-')}")
+    console.print(f"[bold]Status:[/bold]       {idx.status or '-'}")
+    console.print(f"[bold]Docs:[/bold]         {idx.docs_count or '-'}")
+    console.print(f"[bold]Size:[/bold]         {idx.store_size or '-'}")
     console.print(
-        f"[bold]Shards:[/bold]       {idx.get('pri', '-')} primary, {idx.get('rep', '-')} replica"
+        f"[bold]Shards:[/bold]       {idx.pri or '-'} primary, {idx.rep or '-'} replica"
     )
-    console.print(f"[bold]Created:[/bold]      {idx.get('creation.date', '-')}")
+    console.print(f"[bold]Created:[/bold]      {idx.creation_date or '-'}")
 
     # Date range
     console.print()
@@ -131,20 +131,15 @@ def index(name: str, output: str, timestamp_field: str) -> None:
     console.print(f"  Span:         {_format_duration(min_date, max_date)}")
 
     # ILM status
-    indices_ilm = ilm_data.get("indices", {})
-    if indices_ilm:
+    if ilm_data.indices:
         console.print()
         console.print("[bold]ILM Status:[/bold]")
-        for idx_name, ilm_info in indices_ilm.items():
-            if ilm_info.get("managed", False):
-                phase = ilm_info.get("phase", "-")
-                action = ilm_info.get("action", "-")
-                step = ilm_info.get("step", "-")
-                age = ilm_info.get("age", "-")
-                console.print(f"  Phase:        {phase}")
-                console.print(f"  Action:       {action}")
-                console.print(f"  Step:         {step}")
-                console.print(f"  Age:          {age}")
+        for idx_name, ilm_info in ilm_data.indices.items():
+            if ilm_info.managed:
+                console.print(f"  Phase:        {ilm_info.phase or '-'}")
+                console.print(f"  Action:       {ilm_info.action or '-'}")
+                console.print(f"  Step:         {ilm_info.step or '-'}")
+                console.print(f"  Age:          {ilm_info.age or '-'}")
             else:
                 console.print("  Not managed by ILM")
 
@@ -189,9 +184,9 @@ def alias(name: str, output: str, timestamp_field: str) -> None:
     if output == "json":
         result = {
             "alias": name,
-            "indices": alias_data,
-            "index_info": cat_data,
-            "ilm": ilm_data,
+            "indices": {k: v.model_dump() for k, v in alias_data.items()},
+            "index_info": [idx.model_dump(by_alias=True) for idx in cat_data],
+            "ilm": ilm_data.model_dump(),
             "date_range": {"min": min_date, "max": max_date},
         }
         console.print(json.dumps(result, indent=2))
@@ -213,23 +208,18 @@ def alias(name: str, output: str, timestamp_field: str) -> None:
         table.add_column("CREATED")
 
         for idx in cat_data:
-            health = idx.get("health", "")
+            health = idx.health or ""
             health_style = {"green": "green", "yellow": "yellow", "red": "red"}.get(
                 health, ""
             )
-            docs = idx.get("docs.count", "-")
-            try:
-                docs = f"{int(docs):,}"
-            except (ValueError, TypeError):
-                pass
             table.add_row(
-                idx.get("index", ""),
+                idx.index or "",
                 f"[{health_style}]{health}[/{health_style}]"
                 if health_style
                 else health,
-                str(docs),
-                idx.get("store.size", "-"),
-                idx.get("creation.date", "-"),
+                idx.docs_count or "-",
+                idx.store_size or "-",
+                idx.creation_date or "-",
             )
 
         console.print(table)
@@ -242,9 +232,8 @@ def alias(name: str, output: str, timestamp_field: str) -> None:
     console.print(f"  Span:         {_format_duration(min_date, max_date)}")
 
     # ILM status
-    indices_ilm = ilm_data.get("indices", {})
     managed_indices = [
-        (name, info) for name, info in indices_ilm.items() if info.get("managed", False)
+        (idx_name, info) for idx_name, info in ilm_data.indices.items() if info.managed
     ]
 
     if managed_indices:
@@ -259,10 +248,10 @@ def alias(name: str, output: str, timestamp_field: str) -> None:
         for idx_name, ilm_info in managed_indices:
             ilm_table.add_row(
                 idx_name,
-                ilm_info.get("phase", "-"),
-                ilm_info.get("action", "-"),
-                ilm_info.get("step", "-"),
-                ilm_info.get("age", "-"),
+                ilm_info.phase or "-",
+                ilm_info.action or "-",
+                ilm_info.step or "-",
+                ilm_info.age or "-",
             )
 
         console.print(ilm_table)

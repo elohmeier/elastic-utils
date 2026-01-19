@@ -13,7 +13,17 @@ from rich.console import Console
 from rich.markup import escape
 
 from .config import load_credentials
-from .models import AsyncSearchResponse, PITResponse, SearchResponse
+from .models import (
+    AliasInfo,
+    AsyncSearchResponse,
+    ClusterInfo,
+    DateRangeResponse,
+    ILMExplainResponse,
+    IndexAliases,
+    IndexInfo,
+    PITResponse,
+    SearchResponse,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -335,11 +345,11 @@ class ElasticsearchClient:
 
     # Diagnostic operations
 
-    def cluster_info(self) -> dict[str, Any]:
+    def cluster_info(self) -> ClusterInfo:
         """Get cluster info including version."""
         response = self.get("/")
         assert response is not None
-        return response.json()
+        return ClusterInfo.model_validate(response.json())
 
     def cat_indices(
         self,
@@ -347,7 +357,7 @@ class ElasticsearchClient:
         *,
         sort: str = "creation.date",
         headers: str = "index,health,status,docs.count,store.size,creation.date",
-    ) -> list[dict[str, Any]]:
+    ) -> list[IndexInfo]:
         """List indices using _cat/indices API."""
         path = f"/_cat/indices/{pattern}" if pattern else "/_cat/indices"
         response = self.get(
@@ -355,12 +365,12 @@ class ElasticsearchClient:
             params={"format": "json", "s": sort, "h": headers},
         )
         assert response is not None
-        return response.json()
+        return [IndexInfo.model_validate(item) for item in response.json()]
 
     def cat_aliases(
         self,
         pattern: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[AliasInfo]:
         """List aliases using _cat/aliases API."""
         path = f"/_cat/aliases/{pattern}" if pattern else "/_cat/aliases"
         response = self.get(
@@ -368,13 +378,14 @@ class ElasticsearchClient:
             params={"format": "json"},
         )
         assert response is not None
-        return response.json()
+        return [AliasInfo.model_validate(item) for item in response.json()]
 
-    def get_alias(self, alias: str) -> dict[str, Any]:
+    def get_alias(self, alias: str) -> dict[str, IndexAliases]:
         """Get alias details including member indices."""
         response = self.get(f"/{alias}/_alias")
         assert response is not None
-        return response.json()
+        data = response.json()
+        return {k: IndexAliases.model_validate(v) for k, v in data.items()}
 
     def get_index_settings(
         self,
@@ -387,11 +398,11 @@ class ElasticsearchClient:
         assert response is not None
         return response.json()
 
-    def ilm_explain(self, index_pattern: str) -> dict[str, Any]:
+    def ilm_explain(self, index_pattern: str) -> ILMExplainResponse:
         """Get ILM status for indices."""
         response = self.get(f"/{index_pattern}/_ilm/explain")
         assert response is not None
-        return response.json()
+        return ILMExplainResponse.model_validate(response.json())
 
     def get_date_range(
         self,
@@ -410,8 +421,8 @@ class ElasticsearchClient:
             },
         )
         assert response is not None
-        data = response.json()
-        aggs = data.get("aggregations", {})
-        min_val = aggs.get("min_date", {}).get("value_as_string")
-        max_val = aggs.get("max_date", {}).get("value_as_string")
-        return min_val, max_val
+        data = DateRangeResponse.model_validate(response.json())
+        return (
+            data.aggregations.min_date.value_as_string,
+            data.aggregations.max_date.value_as_string,
+        )

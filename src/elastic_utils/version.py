@@ -26,16 +26,13 @@ def version(output: str) -> None:
     info = client.cluster_info()
 
     if output == "json":
-        console.print(json.dumps(info, indent=2))
+        console.print(json.dumps(info.model_dump(), indent=2))
         return
 
-    version_info = info.get("version", {})
-    console.print(f"[bold]Cluster:[/bold]      {info.get('cluster_name', '-')}")
-    console.print(f"[bold]UUID:[/bold]         {info.get('cluster_uuid', '-')}")
-    console.print(f"[bold]Version:[/bold]      {version_info.get('number', '-')}")
+    console.print(f"[bold]Cluster:[/bold]      {info.cluster_name}")
+    console.print(f"[bold]UUID:[/bold]         {info.cluster_uuid}")
+    console.print(f"[bold]Version:[/bold]      {info.version.number}")
     console.print(
-        f"[bold]Build:[/bold]        {version_info.get('build_flavor', '-')} / {version_info.get('build_type', '-')}"
+        f"[bold]Build:[/bold]        {info.version.build_flavor} / {info.version.build_type}"
     )
-    console.print(
-        f"[bold]Lucene:[/bold]       {version_info.get('lucene_version', '-')}"
-    )
+    console.print(f"[bold]Lucene:[/bold]       {info.version.lucene_version}")

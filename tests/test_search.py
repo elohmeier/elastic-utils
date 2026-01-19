@@ -84,7 +84,10 @@ def test_search_submit_with_query_file(
         "is_running": True,
         "is_partial": True,
         "response": {
-            "_shards": {"total": 10, "successful": 3, "skipped": 0, "failed": 0}
+            "_shards": {"total": 10, "successful": 3, "skipped": 0, "failed": 0},
+            "hits": {"hits": []},
+            "took": 100,
+            "timed_out": False,
         },
     }
 
@@ -114,7 +117,10 @@ def test_search_submit_with_stdin(runner: CliRunner, authenticated_creds: Path) 
         "is_running": True,
         "is_partial": True,
         "response": {
-            "_shards": {"total": 5, "successful": 0, "skipped": 0, "failed": 0}
+            "_shards": {"total": 5, "successful": 0, "skipped": 0, "failed": 0},
+            "hits": {"hits": []},
+            "took": 50,
+            "timed_out": False,
         },
     }
 
@@ -171,6 +177,7 @@ def test_search_status_success(runner: CliRunner, authenticated_creds: Path) -> 
         "response": {
             "_shards": {"total": 10, "successful": 10, "skipped": 0, "failed": 0},
             "took": 1234,
+            "timed_out": False,
             "hits": {"hits": [{"_id": "1"}, {"_id": "2"}]},
         },
     }
@@ -191,13 +198,18 @@ def test_search_get_jsonl_output(
     mock_response = MagicMock()
     mock_response.json.return_value = {
         "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
         "response": {
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+            "took": 10,
+            "timed_out": False,
             "hits": {
                 "hits": [
                     {"_id": "1", "_source": {"message": "test1"}},
                     {"_id": "2", "_source": {"message": "test2"}},
                 ]
-            }
+            },
         },
     }
 
@@ -222,12 +234,17 @@ def test_search_get_json_output(runner: CliRunner, authenticated_creds: Path) ->
     mock_response = MagicMock()
     mock_response.json.return_value = {
         "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
         "response": {
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+            "took": 10,
+            "timed_out": False,
             "hits": {
                 "hits": [
                     {"_id": "1", "_source": {"message": "test1"}},
                 ]
-            }
+            },
         },
     }
 
@@ -276,7 +293,10 @@ def test_search_wait_success(runner: CliRunner, authenticated_creds: Path) -> No
         "is_running": True,
         "is_partial": True,
         "response": {
-            "_shards": {"total": 10, "successful": 5, "skipped": 0, "failed": 0}
+            "_shards": {"total": 10, "successful": 5, "skipped": 0, "failed": 0},
+            "hits": {"hits": []},
+            "took": 1000,
+            "timed_out": False,
         },
     }
 
@@ -289,6 +309,7 @@ def test_search_wait_success(runner: CliRunner, authenticated_creds: Path) -> No
         "response": {
             "_shards": {"total": 10, "successful": 10, "skipped": 0, "failed": 0},
             "took": 5000,
+            "timed_out": False,
             "hits": {"hits": [{"_id": "1"}]},
         },
     }

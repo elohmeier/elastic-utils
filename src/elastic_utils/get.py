@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
 
 import click
+from pydantic import BaseModel
 from rich.console import Console
 from rich.table import Table
 
@@ -15,9 +15,11 @@ from .client import ElasticsearchClient
 console = Console()
 
 
-def _output_json(data: list[dict[str, Any]]) -> None:
+def _output_json(data: list[BaseModel]) -> None:
     """Output data as JSON."""
-    console.print(json.dumps(data, indent=2))
+    console.print(
+        json.dumps([item.model_dump(by_alias=True) for item in data], indent=2)
+    )
 
 
 def _format_docs(count: str | None) -> str:
@@ -96,7 +98,7 @@ def indices(pattern: str | None, output: str, sort: str) -> None:
     table.add_column("CREATED")
 
     for idx in data:
-        health = idx.get("health", "")
+        health = idx.health or ""
         health_style = {
             "green": "green",
             "yellow": "yellow",
@@ -104,15 +106,15 @@ def indices(pattern: str | None, output: str, sort: str) -> None:
         }.get(health, "")
 
         row = [
-            idx.get("index", ""),
+            idx.index or "",
             f"[{health_style}]{health}[/{health_style}]" if health_style else health,
-            idx.get("status", ""),
-            _format_docs(idx.get("docs.count")),
-            idx.get("store.size", "-"),
+            idx.status or "",
+            _format_docs(idx.docs_count),
+            idx.store_size or "-",
         ]
         if output == "wide":
-            row.extend([idx.get("pri", "-"), idx.get("rep", "-")])
-        row.append(_format_timestamp(idx.get("creation.date")))
+            row.extend([idx.pri or "-", idx.rep or "-"])
+        row.append(_format_timestamp(idx.creation_date))
         table.add_row(*row)
 
     console.print(table)
@@ -152,11 +154,11 @@ def aliases(pattern: str | None, output: str) -> None:
 
     for alias in data:
         table.add_row(
-            alias.get("alias", ""),
-            alias.get("index", ""),
-            alias.get("filter", "-"),
-            alias.get("routing.index", "-"),
-            alias.get("routing.search", "-"),
+            alias.alias or "",
+            alias.index or "",
+            alias.filter or "-",
+            alias.routing_index or "-",
+            alias.routing_search or "-",
         )
 
     console.print(table)

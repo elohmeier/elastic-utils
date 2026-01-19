@@ -11,6 +11,7 @@ from .config import (
     load_credentials,
     save_credentials,
 )
+from .models import ApiKeyResponse
 
 console = Console()
 
@@ -72,11 +73,9 @@ def login(url: str, username: str, password: str) -> None:
             e, {401: "Authentication failed: Invalid username or password"}
         )
 
-    data = response.json()
-    api_key_id = data["id"]
-    api_key = data["api_key"]
+    data = ApiKeyResponse.model_validate(response.json())
 
-    creds_path = save_credentials(url, api_key_id, api_key)
+    creds_path = save_credentials(url, data.id, data.api_key)
     console.print("[green]Successfully authenticated![/green]")
     console.print(f"API key stored at: {creds_path}")
 

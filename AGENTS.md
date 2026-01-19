@@ -45,8 +45,61 @@ Tests use `pytest-databases` to spin up Elasticsearch in Docker. The custom fixt
 
 Stored at `~/.local/share/elastic-utils/credentials.json` via `platformdirs`.
 
+## Pydantic Models
+
+All API response models in `models.py` are validated against the official Elasticsearch specification:
+
+```
+~/repos/github.com/elastic/elasticsearch-specification/
+```
+
+### Specification Structure
+
+```
+specification/
+├── _types/               # Shared types (Stats.ts, Base.ts, common.ts)
+├── _global/              # Global APIs (search, info, open_point_in_time)
+├── async_search/         # Async search endpoints
+├── cat/                  # CAT APIs (indices, aliases)
+├── security/             # Security APIs (create_api_key)
+└── ilm/                  # ILM APIs (explain_lifecycle)
+```
+
+### Key Spec Files
+
+| Model                 | Spec File                                                 |
+| --------------------- | --------------------------------------------------------- |
+| `Shards`              | `_types/Stats.ts` → `ShardStatistics`                     |
+| `TotalHits`           | `_global/search/_types/hits.ts` → `TotalHits`             |
+| `HitsContainer`       | `_global/search/_types/hits.ts` → `HitsMetadata`          |
+| `AsyncSearchResponse` | `async_search/_types/AsyncSearchResponseBase.ts`          |
+| `SearchResponse`      | `_global/search/SearchResponse.ts` → `ResponseBody`       |
+| `PITResponse`         | `_global/open_point_in_time/OpenPointInTimeResponse.ts`   |
+| `IndexInfo`           | `cat/indices/types.ts` → `IndicesRecord`                  |
+| `AliasInfo`           | `cat/aliases/types.ts` → `AliasesRecord`                  |
+| `ApiKeyResponse`      | `security/create_api_key/SecurityCreateApiKeyResponse.ts` |
+| `ClusterInfo`         | `_global/info/RootNodeInfoResponse.ts`                    |
+| `ClusterVersion`      | `_types/Base.ts` → `ElasticsearchVersionInfo`             |
+| `ILMIndexInfo`        | `ilm/explain_lifecycle/types.ts` → `LifecycleExplain`     |
+
+### Model Guidelines
+
+1. **Required vs Optional**: Follow the spec exactly. Fields marked with `?` in TypeScript are optional
+2. **Types**: Use spec types (`str` for strings, `int` for integers). Note: `_cat` APIs return all values as strings
+3. **Aliases**: Use `Field(alias="...")` for fields with dots (e.g., `docs.count` → `docs_count`)
+4. **Defaults**: Only use defaults for truly optional fields; required fields should have no default
+
+### Adding/Modifying Models
+
+1. Find the relevant spec file in `elasticsearch-specification/specification/`
+2. Check required vs optional fields (look for `?` suffix)
+3. Match types exactly (note: TypeScript `long` → Python `int`)
+4. Add docstring with spec file reference
+5. Update tests with complete mock data for required fields
+
 ## Adding New Commands
 
 After adding new CLI commands:
+
 1. Update `README.md` with usage examples
 2. Update this file if the project structure changes
