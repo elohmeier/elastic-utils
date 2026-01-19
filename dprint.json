@@ -1,0 +1,13 @@
+{
+  "typescript": {
+  },
+  "markup": {
+  },
+  "excludes": [
+    "**/node_modules"
+  ],
+  "plugins": [
+    "https://plugins.dprint.dev/typescript-0.95.13.wasm",
+    "https://plugins.dprint.dev/g-plane/markup_fmt-v0.25.3.wasm"
+  ]
+}
