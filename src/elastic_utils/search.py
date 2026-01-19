@@ -8,7 +8,14 @@ from typing import Any
 
 import click
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from .client import ElasticsearchClient
 from .formatting import format_hits, format_shards, write_output
@@ -131,18 +138,26 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total} shards"),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Waiting for search to complete...", total=None)
+        task = progress.add_task("", total=None)
 
         while True:
             result = client.async_search_poll(search_id)
             if result is None:
                 break
 
+            shards = result.response.shards
             progress.update(
                 task,
-                description=f"Shards: {format_shards(result.response.shards)} | Elapsed: {int(time.time() - start_time)}s",
+                total=shards.total,
+                completed=shards.successful,
+                description=f"(skipped: {shards.skipped}, failed: {shards.failed})",
             )
 
             if not result.is_running:
@@ -302,17 +317,26 @@ def export(
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total} shards"),
+            TimeElapsedColumn(),
+            TextColumn("eta"),
+            TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Processing...", total=None)
+            task = progress.add_task("", total=None)
 
             while True:
                 result = client.async_search_poll(async_search_id)
                 if result is None:
                     break
 
+                shards = result.response.shards
                 progress.update(
-                    task, description=f"Shards: {format_shards(result.response.shards)}"
+                    task,
+                    total=shards.total,
+                    completed=shards.successful,
+                    description=f"(skipped: {shards.skipped}, failed: {shards.failed})",
                 )
 
                 if not result.is_running:
