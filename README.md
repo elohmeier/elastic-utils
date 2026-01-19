@@ -155,6 +155,54 @@ elastic-utils describe alias logs-frozen
 elastic-utils describe alias logs-frozen -o json
 ```
 
+## JSONL Utilities
+
+Post-process JSONL files exported from search commands.
+
+### Extract patterns to Excel/CSV
+
+Extract regex matches from JSONL files along with arbitrary fields:
+
+```bash
+# Extract ID codes with timestamp to Excel
+elastic-utils jsonl extract \
+  --pattern 'ID-\d{4}-[A-Z]+' \
+  --field '_source.@timestamp:timestamp' \
+  -o output.xlsx \
+  search-results.jsonl
+
+# Extract to CSV format
+elastic-utils jsonl extract \
+  --pattern 'ERROR|WARN' \
+  --source-field '_source.level' \
+  --format csv \
+  -o output.csv \
+  logs.jsonl
+
+# Include multiple fields
+elastic-utils jsonl extract \
+  --pattern 'ID-\d{4}-[A-Z]+' \
+  --field '_source.@timestamp:timestamp' \
+  --field '_source.host.name:host' \
+  --field '_source.log.level:level' \
+  -o output.xlsx \
+  search-results.jsonl
+
+# Disable deduplication
+elastic-utils jsonl extract \
+  --pattern 'user=(\w+)' \
+  --no-dedupe \
+  --format csv \
+  -o users.csv \
+  access.jsonl
+```
+
+**Note:** Excel output requires xlsxwriter. Install with:
+
+```bash
+uv tool install 'git+https://github.com/elohmeier/elastic-utils[xlsx]'
+```
+
 ## Development
 
 ```bash

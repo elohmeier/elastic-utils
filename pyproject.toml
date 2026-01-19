@@ -16,6 +16,9 @@ dependencies = [
   "rich-click>=1.9.5",
 ]
 
+[project.optional-dependencies]
+xlsx = ["xlsxwriter>=3.0"]
+
 [project.scripts]
 elastic-utils = "elastic_utils:main"
 
