@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import click
@@ -27,6 +28,18 @@ def _format_docs(count: str | None) -> str:
         return f"{int(count):,}"
     except ValueError:
         return count
+
+
+def _format_timestamp(ts_ms: str | None) -> str:
+    """Format epoch milliseconds to human-readable date."""
+    if not ts_ms:
+        return "-"
+    try:
+        ts = int(ts_ms) / 1000
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError):
+        return ts_ms
 
 
 @click.group()
@@ -99,7 +112,7 @@ def indices(pattern: str | None, output: str, sort: str) -> None:
         ]
         if output == "wide":
             row.extend([idx.get("pri", "-"), idx.get("rep", "-")])
-        row.append(idx.get("creation.date", "-"))
+        row.append(_format_timestamp(idx.get("creation.date")))
         table.add_row(*row)
 
     console.print(table)
