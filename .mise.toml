@@ -1,2 +1,9 @@
 [env]
 _.python.venv = { path = ".venv" }
+
+[tasks.install-fish-completions]
+description = "Install fish completions for elastic-utils"
+run = '''
+mkdir -p ~/.config/fish/completions
+_ELASTIC_UTILS_COMPLETE=fish_source uv run elastic-utils > ~/.config/fish/completions/elastic-utils.fish
+'''
