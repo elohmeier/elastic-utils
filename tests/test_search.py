@@ -53,6 +53,7 @@ def test_search_help(runner: CliRunner) -> None:
     assert "get" in result.output
     assert "delete" in result.output
     assert "export" in result.output
+    assert "import" in result.output
 
 
 def test_search_submit_not_authenticated(
@@ -338,6 +339,227 @@ def test_search_connection_error(runner: CliRunner, authenticated_creds: Path) -
     assert "Connection error" in result.output
 
 
+def test_search_import_success(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Test import command with successful bulk create."""
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text('{"_id":"1","_source":{"message":"test"}}\n')
+
+    mock_client = MagicMock()
+    mock_client.index_exists.return_value = True
+    mock_client.bulk.return_value = {"items": [{"create": {"_id": "1", "status": 201}}]}
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "import",
+                "--index",
+                "dest-index",
+                "--input",
+                str(input_file),
+                "--url",
+                "http://dest:9200",
+                "--api-key-id",
+                "id",
+                "--api-key",
+                "key",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Import complete" in result.output
+    assert "Created: 1" in result.output
+
+
+def test_search_import_conflict_skipped(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Test import command skips conflicts and exits successfully."""
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text('{"_id":"1","_source":{"message":"test"}}\n')
+
+    mock_client = MagicMock()
+    mock_client.index_exists.return_value = True
+    mock_client.bulk.return_value = {"items": [{"create": {"_id": "1", "status": 409}}]}
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "import",
+                "--index",
+                "dest-index",
+                "--input",
+                str(input_file),
+                "--url",
+                "http://dest:9200",
+                "--api-key-id",
+                "id",
+                "--api-key",
+                "key",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Conflicts skipped: 1" in result.output
+
+
+def test_search_import_non_conflict_failure(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Test import command exits with error for non-conflict bulk failures."""
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text('{"_id":"1","_source":{"message":"test"}}\n')
+
+    mock_client = MagicMock()
+    mock_client.index_exists.return_value = True
+    mock_client.bulk.return_value = {
+        "items": [
+            {
+                "create": {
+                    "_id": "1",
+                    "status": 400,
+                    "error": {"type": "mapper_parsing_exception", "reason": "bad field"},
+                }
+            }
+        ]
+    }
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "import",
+                "--index",
+                "dest-index",
+                "--input",
+                str(input_file),
+                "--url",
+                "http://dest:9200",
+                "--api-key-id",
+                "id",
+                "--api-key",
+                "key",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Bulk item failed" in result.output
+    assert "Failed: 1" in result.output
+
+
+def test_search_import_missing_source_field(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Test import command validates required _source field."""
+    input_file = tmp_path / "input.jsonl"
+    input_file.write_text('{"_id":"1"}\n')
+
+    mock_client = MagicMock()
+    mock_client.index_exists.return_value = True
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "import",
+                "--index",
+                "dest-index",
+                "--input",
+                str(input_file),
+                "--url",
+                "http://dest:9200",
+                "--api-key-id",
+                "id",
+                "--api-key",
+                "key",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "missing object '_source' field" in result.output
+
+
+def test_search_export_with_explicit_auth(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Test export command works with explicit auth options."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.jsonl"
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 1
+
+    hit_result = MagicMock()
+    hit_result.hit_list = [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
+    hit_result.pit_id = "pit-2"
+
+    empty_result = MagicMock()
+    empty_result.hit_list = []
+    empty_result.pit_id = None
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.open_pit.return_value = "pit-1"
+    mock_client.search_with_pit.side_effect = [hit_result, empty_result]
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--url",
+                "http://source:9200",
+                "--api-key-id",
+                "id",
+                "--api-key",
+                "key",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Export complete" in result.output
+    assert output_file.exists()
+
+
 # Integration tests with real Elasticsearch
 
 
@@ -510,3 +732,177 @@ def test_search_export_integration(
     assert output_file.exists()
     lines = output_file.read_text().strip().split("\n")
     assert len(lines) == 5
+
+
+def test_search_export_import_roundtrip_integration(
+    runner: CliRunner,
+    mock_creds_path: Path,
+    elasticsearch_secure_service: ElasticsearchSecureService,
+    tmp_path: Path,
+) -> None:
+    """Test offline-style export/import roundtrip against real Elasticsearch."""
+    url = f"{elasticsearch_secure_service.scheme}://{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
+
+    login_result = runner.invoke(
+        cli,
+        [
+            "auth",
+            "login",
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+        ],
+    )
+    assert login_result.exit_code == 0
+
+    import httpx as real_httpx
+
+    source_index = "transfer-source-index"
+    dest_index = "transfer-dest-index"
+
+    for index_name in [source_index, dest_index]:
+        try:
+            real_httpx.delete(
+                f"{url}/{index_name}",
+                auth=(
+                    elasticsearch_secure_service.user,
+                    elasticsearch_secure_service.password,
+                ),
+                timeout=30.0,
+            )
+        except Exception:
+            pass
+
+    mappings = {
+        "mappings": {
+            "properties": {
+                "message": {"type": "text"},
+                "@timestamp": {"type": "date"},
+            }
+        }
+    }
+
+    real_httpx.put(
+        f"{url}/{source_index}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json=mappings,
+        timeout=30.0,
+    )
+    real_httpx.put(
+        f"{url}/{dest_index}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json=mappings,
+        timeout=30.0,
+    )
+
+    expected_ids = ["doc-1", "doc-2", "doc-3"]
+    for i, doc_id in enumerate(expected_ids, start=1):
+        real_httpx.put(
+            f"{url}/{source_index}/_doc/{doc_id}",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            json={
+                "message": f"roundtrip message {i}",
+                "@timestamp": f"2026-01-19T12:00:0{i}Z",
+            },
+            timeout=30.0,
+        )
+
+    real_httpx.post(
+        f"{url}/{source_index}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+    real_httpx.post(
+        f"{url}/{dest_index}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+
+    query_file = tmp_path / "roundtrip-query.json"
+    query_file.write_text('{"query": {"match_all": {}}}')
+    output_file = tmp_path / "roundtrip-export.jsonl"
+
+    export_result = runner.invoke(
+        cli,
+        [
+            "search",
+            "export",
+            "--index",
+            source_index,
+            "--query-file",
+            str(query_file),
+            "--output",
+            str(output_file),
+            "--page-size",
+            "2",
+        ],
+    )
+    assert export_result.exit_code == 0
+    assert output_file.exists()
+
+    import_result = runner.invoke(
+        cli,
+        [
+            "search",
+            "import",
+            "--index",
+            dest_index,
+            "--input",
+            str(output_file),
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+            "--batch-size",
+            "2",
+            "--refresh",
+            "wait_for",
+        ],
+    )
+    assert import_result.exit_code == 0
+    assert "Created: 3" in import_result.output
+    assert "Conflicts skipped: 0" in import_result.output
+
+    search_response = real_httpx.post(
+        f"{url}/{dest_index}/_search",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json={"size": 10, "query": {"match_all": {}}},
+        timeout=30.0,
+    )
+    search_response.raise_for_status()
+    hits = search_response.json()["hits"]["hits"]
+    restored_ids = sorted(hit["_id"] for hit in hits)
+    assert restored_ids == expected_ids
+
+    reimport_result = runner.invoke(
+        cli,
+        [
+            "search",
+            "import",
+            "--index",
+            dest_index,
+            "--input",
+            str(output_file),
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+            "--batch-size",
+            "2",
+            "--refresh",
+            "wait_for",
+        ],
+    )
+    assert reimport_result.exit_code == 0
+    assert "Created: 0" in reimport_result.output
+    assert "Conflicts skipped: 3" in reimport_result.output

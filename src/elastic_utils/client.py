@@ -88,6 +88,78 @@ class ElasticsearchClient:
 
         return cls(creds["url"], headers, console)
 
+    @classmethod
+    def from_auth(
+        cls,
+        *,
+        url: str,
+        api_key_id: str | None = None,
+        api_key: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        console: Console | None = None,
+    ) -> Self:
+        """Create client from explicit auth options (API key or basic auth)."""
+        console = console or Console()
+
+        if api_key_id or api_key:
+            if not (api_key_id and api_key):
+                console.print(
+                    "[red]Both --api-key-id and --api-key are required for API key auth.[/red]"
+                )
+                raise SystemExit(1)
+            encoded = base64.b64encode(f"{api_key_id}:{api_key}".encode()).decode()
+            headers = {"Authorization": f"ApiKey {encoded}"}
+            return cls(url, headers, console)
+
+        if username or password:
+            if not (username and password):
+                console.print(
+                    "[red]Both --username and --password are required for basic auth.[/red]"
+                )
+                raise SystemExit(1)
+            encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers = {"Authorization": f"Basic {encoded}"}
+            return cls(url, headers, console)
+
+        console.print(
+            "[red]Explicit auth requires API key (--api-key-id/--api-key) or basic auth (--username/--password).[/red]"
+        )
+        raise SystemExit(1)
+
+    @classmethod
+    def from_auth_or_credentials(
+        cls,
+        *,
+        url: str | None = None,
+        api_key_id: str | None = None,
+        api_key: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        console: Console | None = None,
+    ) -> Self:
+        """Create client from explicit auth options, or fallback to stored credentials."""
+        has_explicit_auth = any([url, api_key_id, api_key, username, password])
+
+        if not has_explicit_auth:
+            return cls.from_credentials(console)
+
+        if not url:
+            (console or Console()).print(
+                "[red]--url is required when providing explicit authentication options.[/red]"
+            )
+            raise SystemExit(1)
+
+        # API key takes precedence if both auth methods are provided.
+        return cls.from_auth(
+            url=url,
+            api_key_id=api_key_id,
+            api_key=api_key,
+            username=None if api_key_id and api_key else username,
+            password=None if api_key_id and api_key else password,
+            console=console,
+        )
+
     @contextmanager
     def session(self) -> Iterator[Self]:
         """Context manager for connection pooling with httpx.Client."""
@@ -108,6 +180,8 @@ class ElasticsearchClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        content: str | bytes | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         status_handlers: dict[int, StatusHandler] | None = None,
     ) -> httpx.Response | None:
@@ -133,15 +207,22 @@ class ElasticsearchClient:
         try:
             if self._client:
                 response = self._client.request(
-                    method, path, params=params, json=json, timeout=timeout
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    content=content,
+                    headers=headers,
+                    timeout=timeout,
                 )
             else:
                 response = httpx.request(
                     method,
                     f"{self.base_url}{path}",
-                    headers=self.headers,
+                    headers=self.headers | (headers or {}),
                     params=params,
                     json=json,
+                    content=content,
                     timeout=timeout,
                 )
             response.raise_for_status()
@@ -194,6 +275,8 @@ class ElasticsearchClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        content: str | bytes | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         status_handlers: dict[int, StatusHandler] | None = None,
     ) -> httpx.Response | None:
@@ -203,6 +286,8 @@ class ElasticsearchClient:
             path,
             params=params,
             json=json,
+            content=content,
+            headers=headers,
             timeout=timeout,
             status_handlers=status_handlers,
         )
@@ -426,3 +511,30 @@ class ElasticsearchClient:
             data.aggregations.min_date.value_as_string,
             data.aggregations.max_date.value_as_string,
         )
+
+    def index_exists(self, index: str) -> bool:
+        """Check if index exists."""
+        response = self.get(
+            f"/{index}",
+            timeout=30.0,
+            status_handlers=NOT_FOUND_SILENT,
+        )
+        return response is not None
+
+    def bulk(
+        self,
+        ndjson_payload: str,
+        *,
+        refresh: str = "false",
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Execute a bulk request with NDJSON payload."""
+        response = self.post(
+            "/_bulk",
+            params={"refresh": refresh},
+            content=ndjson_payload,
+            headers={"Content-Type": "application/x-ndjson"},
+            timeout=timeout,
+        )
+        assert response is not None
+        return response.json()

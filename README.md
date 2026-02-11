@@ -83,6 +83,47 @@ elastic-utils search export --index alias-frozen --query-file query.json \
 # Custom page size
 elastic-utils search export --index alias-frozen --query-file query.json \
   --page-size 500 --keep-alive 15m -o results.jsonl
+
+# Export with explicit source credentials (instead of stored auth)
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --url http://source-es:9200 --username elastic --password secret \
+  -o results.jsonl
+```
+
+### Import exported results
+
+Import raw-hit JSONL created by `search export` into an existing destination index:
+
+```bash
+elastic-utils search import --index logs-restored --input results.jsonl \
+  --url http://dest-es:9200 --username elastic --password secret
+
+# API key auth
+elastic-utils search import --index logs-restored --input results.jsonl \
+  --url http://dest-es:9200 --api-key-id <id> --api-key <key>
+```
+
+Import behavior:
+- Preserves source `_id`
+- Uses bulk `create` operations
+- Skips duplicates as conflicts (does not overwrite existing documents)
+- Fails if destination index does not exist
+
+### Offline Copy Between Clusters
+
+For air-gapped/disconnected clusters:
+
+```bash
+# 1) Export from source cluster
+elastic-utils search export --index logs-source --query-file query.json \
+  --url http://source-es:9200 --username elastic --password source-pass \
+  -o logs-export.jsonl
+
+# 2) Transfer logs-export.jsonl to destination environment (scp/usb/etc.)
+
+# 3) Import into destination cluster (index must already exist)
+elastic-utils search import --index logs-destination --input logs-export.jsonl \
+  --url http://dest-es:9200 --username elastic --password dest-pass
 ```
 
 ### Query file format
