@@ -7,8 +7,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any
-from queue import Queue
 
 import click
 from rich.console import Console
@@ -613,6 +613,20 @@ def export(
     stop_event = threading.Event()
     worker_errors: list[str] = []
     lock = threading.Lock()
+    aborted = False
+
+    def enqueue_chunk(item: ExportChunk | Exception | None) -> None:
+        """Put items into the queue without blocking shutdown forever."""
+        while not stop_event.is_set():
+            try:
+                chunks.put(item, timeout=0.2)
+                return
+            except Full:
+                continue
+        try:
+            chunks.put_nowait(item)
+        except Full:
+            pass
 
     def worker(worker_id: int) -> None:
         local_client = create_client(
@@ -632,7 +646,8 @@ def export(
                     pit_query = query.copy()
                     pit_query["size"] = local_page_size
                     pit_query["pit"] = {"id": pit_id, "keep_alive": keep_alive}
-                    pit_query["slice"] = {"id": worker_id, "max": resolved_workers}
+                    if resolved_workers > 1:
+                        pit_query["slice"] = {"id": worker_id, "max": resolved_workers}
                     pit_query["sort"] = query.get("sort", [{"@timestamp": "asc"}]) + [
                         {"_shard_doc": "asc"}
                     ]
@@ -653,7 +668,7 @@ def export(
                         break
 
                     payload_bytes = len(json.dumps(response, separators=(",", ":")))
-                    chunks.put(
+                    enqueue_chunk(
                         ExportChunk(
                             hits=hits,
                             page_size=local_page_size,
@@ -677,7 +692,7 @@ def export(
                             max_page_size=max_page_size,
                         )
         except Exception as e:
-            chunks.put(e)
+            enqueue_chunk(e)
             stop_event.set()
         finally:
             if pit_id:
@@ -685,69 +700,77 @@ def export(
                     local_client.close_pit(pit_id)
                 except Exception:
                     pass
-            chunks.put(None)
+            enqueue_chunk(None)
 
     docs_written = 0
     pages = 0
     recent_page_size = page_size
 
+    executor = ThreadPoolExecutor(max_workers=resolved_workers)
+    futures = [executor.submit(worker, worker_id) for worker_id in range(resolved_workers)]
     try:
-        with ThreadPoolExecutor(max_workers=resolved_workers) as executor:
-            futures = [
-                executor.submit(worker, worker_id)
-                for worker_id in range(resolved_workers)
-            ]
+        with Progress(
+            SpinnerColumn(),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("•"),
+            TextColumn("[progress.description]{task.description}"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("eta"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(
+                "Starting...", total=total_docs if total_docs > 0 else None
+            )
+            finished_workers = 0
+            while finished_workers < resolved_workers:
+                try:
+                    chunk = chunks.get(timeout=0.2)
+                except Empty:
+                    continue
+                if chunk is None:
+                    finished_workers += 1
+                    continue
 
-            with Progress(
-                SpinnerColumn(),
-                BarColumn(),
-                TaskProgressColumn(),
-                TextColumn("•"),
-                TextColumn("[progress.description]{task.description}"),
-                TextColumn("•"),
-                TimeElapsedColumn(),
-                TextColumn("eta"),
-                TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    "Starting...", total=total_docs if total_docs > 0 else None
+                if isinstance(chunk, Exception):
+                    with lock:
+                        worker_errors.append(str(chunk))
+                    stop_event.set()
+                    continue
+
+                pages += 1
+                if sink:
+                    sink.write_hits(chunk.hits)
+                else:
+                    all_hits.extend(chunk.hits)
+
+                docs_written += len(chunk.hits)
+                recent_page_size = chunk.page_size
+                progress.update(
+                    task,
+                    completed=docs_written,
+                    description=(
+                        f"Pages {pages} • {docs_written:,} docs"
+                        f" • page_size~{recent_page_size}"
+                    ),
                 )
-                finished_workers = 0
-                while finished_workers < resolved_workers:
-                    chunk = chunks.get()
-                    if chunk is None:
-                        finished_workers += 1
-                        continue
 
-                    if isinstance(chunk, Exception):
-                        with lock:
-                            worker_errors.append(str(chunk))
-                        stop_event.set()
-                        continue
-
-                    pages += 1
-                    if sink:
-                        sink.write_hits(chunk.hits)
-                    else:
-                        all_hits.extend(chunk.hits)
-
-                    docs_written += len(chunk.hits)
-                    recent_page_size = chunk.page_size
-                    progress.update(
-                        task,
-                        completed=docs_written,
-                        description=(
-                            f"Pages {pages} • {docs_written:,} docs"
-                            f" • page_size~{recent_page_size}"
-                        ),
-                    )
-
-            for future in futures:
-                future.result()
+        for future in futures:
+            future.result()
+    except KeyboardInterrupt:
+        aborted = True
+        stop_event.set()
+        console.print("\n[yellow]Interrupt received, stopping workers...[/yellow]")
     finally:
+        stop_event.set()
+        executor.shutdown(wait=False, cancel_futures=True)
         if sink:
             sink.close()
+
+    if aborted:
+        raise SystemExit(130)
 
     if worker_errors:
         console.print(f"[red]Export failed:[/red] {worker_errors[0]}")

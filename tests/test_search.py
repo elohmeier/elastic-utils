@@ -1,6 +1,10 @@
 """Tests for search commands."""
 
 import json
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1118,3 +1122,128 @@ def test_search_export_import_parquet_roundtrip_integration(
     hits = search_response.json()["hits"]["hits"]
     restored_ids = sorted(hit["_id"] for hit in hits)
     assert restored_ids == expected_ids
+
+
+def test_search_export_interrupt_shutdown_integration(
+    runner: CliRunner,
+    elasticsearch_secure_service: ElasticsearchSecureService,
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C during export should stop without thread-shutdown traceback."""
+    import httpx as real_httpx
+
+    url = (
+        f"{elasticsearch_secure_service.scheme}://"
+        f"{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
+    )
+    index_name = "interrupt-export-index"
+
+    try:
+        real_httpx.delete(
+            f"{url}/{index_name}",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            timeout=30.0,
+        )
+    except Exception:
+        pass
+
+    real_httpx.put(
+        f"{url}/{index_name}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json={
+            "mappings": {
+                "properties": {
+                    "message": {"type": "text"},
+                    "@timestamp": {"type": "date"},
+                }
+            }
+        },
+        timeout=30.0,
+    )
+    for i in range(5000):
+        real_httpx.post(
+            f"{url}/{index_name}/_doc",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            json={
+                "message": f"interrupt document {i}",
+                "@timestamp": f"2026-01-19T12:{i // 60:02d}:{i % 60:02d}Z",
+            },
+            timeout=30.0,
+        )
+    real_httpx.post(
+        f"{url}/{index_name}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+
+    query_file = tmp_path / "interrupt-query.json"
+    query_file.write_text('{"query": {"match_all": {}}}')
+    output_file = tmp_path / "interrupt-export.jsonl"
+
+    cli_bin = Path(sys.executable).with_name("elastic-utils")
+    process = subprocess.Popen(
+        [  # noqa: S603
+            str(cli_bin),
+            "search",
+            "export",
+            "--index",
+            index_name,
+            "--query-file",
+            str(query_file),
+            "--output",
+            str(output_file),
+            "--format",
+            "jsonl",
+            "--workers",
+            "2",
+            "--no-adaptive-page-size",
+            "--page-size",
+            "1",
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    output_parts: list[str] = []
+    start = time.monotonic()
+    while time.monotonic() - start < 120:
+        if process.stdout is None:
+            break
+        line = process.stdout.readline()
+        if line:
+            output_parts.append(line)
+            if "Fetching with" in line:
+                break
+            continue
+        if process.poll() is not None:
+            break
+
+    if process.poll() is None:
+        process.send_signal(signal.SIGINT)
+
+    try:
+        remaining, _ = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        remaining, _ = process.communicate(timeout=5)
+
+    output = "".join(output_parts) + (remaining or "")
+
+    assert process.returncode != 0
+    assert "Exception ignored on threading shutdown" not in output
+    assert (
+        "Interrupt received, stopping workers" in output or "Aborted." in output
+    )
