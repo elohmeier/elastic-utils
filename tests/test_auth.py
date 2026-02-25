@@ -162,6 +162,7 @@ def test_auth_login_insecure_sets_verify_false(
     runner: CliRunner, mock_creds_path: Path
 ) -> None:
     """Test login forwards verify=False when --insecure is set."""
+
     class MockResponse:
         def raise_for_status(self) -> None:
             pass
@@ -176,7 +177,9 @@ def test_auth_login_insecure_sets_verify_false(
 
     mock_response = MockResponse()
 
-    with patch("elastic_utils.auth.httpx.post", return_value=mock_response) as mock_post:
+    with patch(
+        "elastic_utils.auth.httpx.post", return_value=mock_response
+    ) as mock_post:
         result = runner.invoke(
             cli,
             [
