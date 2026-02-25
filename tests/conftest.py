@@ -3,16 +3,71 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import shutil
+import socket
+import subprocess
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
-
 from pytest_databases._service import DockerService
 from pytest_databases.types import ServiceContainer
 
+
+def _configure_docker_host_for_podman() -> None:
+    """Auto-configure DOCKER_HOST for podman when docker CLI is unavailable."""
+    if os.environ.get("DOCKER_HOST"):
+        return
+    if shutil.which("docker"):
+        return
+    if not shutil.which("podman"):
+        return
+
+    socket_path = Path(f"/run/user/{os.getuid()}/podman/podman.sock")
+    try:
+        subprocess.run(  # noqa: S603
+            ["systemctl", "--user", "start", "podman.socket"],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(  # noqa: S603
+            ["systemctl", "--user", "start", "podman.service"],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not socket_path.exists():
+            time.sleep(0.1)
+            continue
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            try:
+                sock.connect(str(socket_path))
+                break
+            except OSError:
+                time.sleep(0.1)
+    else:
+        return
+
+    if socket_path.exists():
+        os.environ["DOCKER_HOST"] = f"unix://{socket_path}"
+
+
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+
+def pytest_configure() -> None:
+    """Prepare test runtime environment before fixtures initialize."""
+    _configure_docker_host_for_podman()
 
 
 @dataclasses.dataclass

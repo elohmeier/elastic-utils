@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import datetime, timezone
 
 import click
@@ -15,7 +16,7 @@ from .client import ElasticsearchClient
 console = Console()
 
 
-def _output_json(data: list[BaseModel]) -> None:
+def _output_json(data: Iterable[BaseModel]) -> None:
     """Output data as JSON."""
     console.print(
         json.dumps([item.model_dump(by_alias=True) for item in data], indent=2)

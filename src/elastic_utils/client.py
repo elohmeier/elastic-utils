@@ -428,6 +428,40 @@ class ElasticsearchClient:
         assert response is not None
         return SearchResponse.model_validate(response.json())
 
+    def search_with_pit_raw(
+        self,
+        query: dict[str, Any],
+        *,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Execute a PIT search and return raw JSON for hot pagination paths."""
+        response = self.post(
+            "/_search",
+            json=query,
+            timeout=timeout,
+        )
+        assert response is not None
+        return response.json()
+
+    def primary_shard_count(self, index: str) -> int:
+        """Get primary shard count for worker auto-sizing."""
+        response = self.get(f"/{index}/_settings")
+        assert response is not None
+        settings = response.json()
+
+        total = 0
+        for index_settings in settings.values():
+            index_root = index_settings.get("settings", {}).get("index", {})
+            shards = index_root.get("number_of_shards")
+            if shards is None:
+                continue
+            try:
+                total += int(shards)
+            except (TypeError, ValueError):
+                continue
+
+        return total
+
     # Diagnostic operations
 
     def cluster_info(self) -> ClusterInfo:

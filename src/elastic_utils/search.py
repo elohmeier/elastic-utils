@@ -2,9 +2,13 @@
 
 import json
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from queue import Queue
 
 import click
 from rich.console import Console
@@ -65,6 +69,147 @@ def read_query(query_file: Path | None) -> dict[str, Any]:
     except json.JSONDecodeError as e:
         console.print(f"[red]Invalid JSON:[/red] {e}")
         raise SystemExit(1)
+
+
+@dataclass
+class ExportChunk:
+    """Batch of hits produced by a slice worker."""
+
+    hits: list[dict[str, Any]]
+    page_size: int
+    page_duration: float
+    payload_bytes: int
+
+
+def adapt_page_size(
+    current_size: int,
+    page_duration: float,
+    payload_bytes: int,
+    returned_hits: int,
+    *,
+    min_page_size: int,
+    max_page_size: int,
+) -> int:
+    """Adapt page size based on latency and response payload."""
+    if returned_hits == 0 or returned_hits < current_size:
+        return current_size
+
+    next_size = current_size
+    if page_duration < 0.8 and payload_bytes < 8_000_000:
+        next_size = int(current_size * 1.25)
+    elif page_duration > 2.5 or payload_bytes > 20_000_000:
+        next_size = int(current_size * 0.7)
+
+    return max(min_page_size, min(max_page_size, next_size))
+
+
+class HitSink:
+    """Streaming sink for exported hits."""
+
+    def write_hits(self, hits: list[dict[str, Any]]) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class JsonlSink(HitSink):
+    """Writes hits in JSONL format."""
+
+    def __init__(self, output: Path | None) -> None:
+        self._output = output
+        self._file = output.open("w") if output else None
+
+    def write_hits(self, hits: list[dict[str, Any]]) -> None:
+        if self._file:
+            for hit in hits:
+                self._file.write(json.dumps(hit) + "\n")
+            self._file.flush()
+            return
+        for hit in hits:
+            print(json.dumps(hit))
+
+    def close(self) -> None:
+        if self._file:
+            self._file.close()
+
+
+class ParquetSink(HitSink):
+    """Writes hits to a parquet stream with buffered row groups."""
+
+    def __init__(self, output: Path, compression: str, row_group_size: int) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            console.print(
+                "[red]Parquet support requires pyarrow. Install with:[/red] "
+                "[bold]uv sync[/bold]"
+            )
+            raise SystemExit(1)
+
+        codec = None if compression == "none" else compression
+        self._pa = pa
+        self._schema = pa.schema(
+            [
+                pa.field("hit_json", pa.large_string()),
+                pa.field("_id", pa.string()),
+                pa.field("_index", pa.string()),
+            ]
+        )
+        self._writer = pq.ParquetWriter(
+            str(output),
+            self._schema,
+            compression=codec,
+        )
+        self._row_group_size = row_group_size
+        self._rows: list[dict[str, str | None]] = []
+
+    def _flush_rows(self) -> None:
+        if not self._rows:
+            return
+
+        table = self._pa.table(
+            {
+                "hit_json": self._pa.array(
+                    [row["hit_json"] for row in self._rows], type=self._pa.large_string()
+                ),
+                "_id": self._pa.array(
+                    [row["_id"] for row in self._rows], type=self._pa.string()
+                ),
+                "_index": self._pa.array(
+                    [row["_index"] for row in self._rows], type=self._pa.string()
+                ),
+            },
+            schema=self._schema,
+        )
+        self._writer.write_table(table)
+        self._rows.clear()
+
+    def write_hits(self, hits: list[dict[str, Any]]) -> None:
+        for hit in hits:
+            self._rows.append(
+                {
+                    "hit_json": json.dumps(hit, separators=(",", ":")),
+                    "_id": hit.get("_id"),
+                    "_index": hit.get("_index"),
+                }
+            )
+            if len(self._rows) >= self._row_group_size:
+                self._flush_rows()
+
+    def close(self) -> None:
+        self._flush_rows()
+        self._writer.close()
+
+
+def infer_input_format(input_file: Path, input_format: str | None) -> str:
+    """Infer import format from extension unless explicitly set."""
+    if input_format:
+        return input_format
+    if input_file.suffix.lower() == ".parquet":
+        return "parquet"
+    return "jsonl"
 
 
 @click.group()
@@ -262,7 +407,7 @@ def delete(search_id: str) -> None:
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["json", "jsonl"]),
+    type=click.Choice(["json", "jsonl", "parquet"]),
     default="jsonl",
     help="Output format (default: jsonl)",
 )
@@ -270,7 +415,42 @@ def delete(search_id: str) -> None:
     "--page-size",
     default=1000,
     type=int,
-    help="Results per page (default: 1000)",
+    help="Initial results per page (default: 1000)",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=0,
+    help="Number of parallel PIT slice workers (default: auto by shards, max 8)",
+)
+@click.option(
+    "--adaptive-page-size/--no-adaptive-page-size",
+    default=True,
+    help="Auto-tune page size by latency/payload (default: enabled)",
+)
+@click.option(
+    "--min-page-size",
+    default=250,
+    type=int,
+    help="Minimum adaptive page size (default: 250)",
+)
+@click.option(
+    "--max-page-size",
+    default=5000,
+    type=int,
+    help="Maximum adaptive page size (default: 5000)",
+)
+@click.option(
+    "--parquet-compression",
+    type=click.Choice(["zstd", "snappy", "gzip", "none"]),
+    default="zstd",
+    help="Parquet compression codec (default: zstd)",
+)
+@click.option(
+    "--parquet-row-group-size",
+    default=50000,
+    type=int,
+    help="Rows per parquet row group (default: 50000)",
 )
 @click.option(
     "--keep-alive",
@@ -296,6 +476,12 @@ def export(
     output: Path | None,
     output_format: str,
     page_size: int,
+    workers: int,
+    adaptive_page_size: bool,
+    min_page_size: int,
+    max_page_size: int,
+    parquet_compression: str,
+    parquet_row_group_size: int,
     keep_alive: str,
     from_date: str | None,
     to_date: str | None,
@@ -306,6 +492,27 @@ def export(
     password: str | None,
 ) -> None:
     """Export all search results using async search + PIT pagination."""
+    if page_size <= 0:
+        console.print("[red]--page-size must be greater than 0.[/red]")
+        raise SystemExit(1)
+    if min_page_size <= 0 or max_page_size <= 0:
+        console.print("[red]--min-page-size and --max-page-size must be > 0.[/red]")
+        raise SystemExit(1)
+    if min_page_size > max_page_size:
+        console.print(
+            "[red]--min-page-size cannot be greater than --max-page-size.[/red]"
+        )
+        raise SystemExit(1)
+    if workers < 0:
+        console.print("[red]--workers cannot be negative.[/red]")
+        raise SystemExit(1)
+    if parquet_row_group_size <= 0:
+        console.print("[red]--parquet-row-group-size must be greater than 0.[/red]")
+        raise SystemExit(1)
+    if output_format == "parquet" and not output:
+        console.print("[red]Parquet export requires --output.[/red]")
+        raise SystemExit(1)
+
     client = create_client(
         url=url,
         api_key_id=api_key_id,
@@ -339,17 +546,16 @@ def export(
     query["size"] = page_size
 
     console.print(f"[bold]Starting export from {index}[/bold]")
-
-    # Use session for connection pooling during multi-request export
     with client.session():
-        # Step 1: Run async search to verify query works on frozen indices
         console.print("Running initial async search...")
         initial_result = client.async_search_submit(
             index, query, wait_for="1s", keep_alive="1h"
         )
         async_search_id = initial_result.id
+        if not async_search_id:
+            console.print("[red]Async search did not return a search ID.[/red]")
+            raise SystemExit(1)
 
-        # Step 2: Wait for async search to complete
         console.print("Waiting for async search to complete...")
         with Progress(
             SpinnerColumn(),
@@ -362,7 +568,6 @@ def export(
             console=console,
         ) as progress:
             task = progress.add_task("", total=None)
-
             while True:
                 result = client.async_search_poll(async_search_id)
                 if result is None:
@@ -375,43 +580,124 @@ def export(
                     completed=shards.successful,
                     description=f"(skipped: {shards.skipped}, failed: {shards.failed})",
                 )
-
                 if not result.is_running:
                     break
-
                 time.sleep(5)
 
         total_docs = result.total_hits if result else 0
         console.print(f"Initial search complete, total matching docs: {total_docs:,}")
-
-        # Cleanup async search
         client.async_search_delete(async_search_id, silent=True)
 
-        # Step 3: Open PIT for pagination
-        console.print("Opening Point-in-Time for pagination...")
-        pit_id = client.open_pit(index, keep_alive=keep_alive)
+        shard_count = client.primary_shard_count(index)
+        resolved_workers = workers if workers > 0 else max(1, min(shard_count, 8))
+        if output_format == "json":
+            resolved_workers = 1
+        console.print(
+            f"Fetching with {resolved_workers} worker(s)"
+            f"{' and adaptive page sizing' if adaptive_page_size else ''}..."
+        )
 
-        # Step 4: Paginate through all results
+    if output_format == "json":
         all_hits: list[dict[str, Any]] = []
-        search_after = None
-        page = 0
-        docs_written = 0
+        sink: HitSink | None = None
+    elif output_format == "jsonl":
+        sink = JsonlSink(output)
+        all_hits = []
+    else:
+        assert output is not None
+        sink = ParquetSink(output, parquet_compression, parquet_row_group_size)
+        all_hits = []
 
-        # Prepare query for PIT search (add _shard_doc tiebreaker for pagination)
-        pit_query = query.copy()
-        pit_query["pit"] = {"id": pit_id, "keep_alive": keep_alive}
-        # Add _shard_doc tiebreaker for efficient pagination with PIT
-        pit_query["sort"] = query.get("sort", [{"@timestamp": "asc"}]) + [
-            {"_shard_doc": "asc"}
-        ]
+    queue_max_size = max(2 * resolved_workers, 2)
+    chunks: Queue[ExportChunk | Exception | None] = Queue(maxsize=queue_max_size)
+    stop_event = threading.Event()
+    worker_errors: list[str] = []
+    lock = threading.Lock()
 
-        # Open file for streaming writes (JSONL only)
-        output_file = None
-        if output and output_format == "jsonl":
-            output_file = open(output, "w")  # noqa: SIM115
-
-        console.print("Fetching all pages...")
+    def worker(worker_id: int) -> None:
+        local_client = create_client(
+            url=url,
+            api_key_id=api_key_id,
+            api_key=api_key,
+            username=username,
+            password=password,
+        )
+        pit_id: str | None = None
         try:
+            with local_client.session():
+                pit_id = local_client.open_pit(index, keep_alive=keep_alive)
+                local_page_size = max(min(page_size, max_page_size), min_page_size)
+                search_after = None
+                while not stop_event.is_set():
+                    pit_query = query.copy()
+                    pit_query["size"] = local_page_size
+                    pit_query["pit"] = {"id": pit_id, "keep_alive": keep_alive}
+                    pit_query["slice"] = {"id": worker_id, "max": resolved_workers}
+                    pit_query["sort"] = query.get("sort", [{"@timestamp": "asc"}]) + [
+                        {"_shard_doc": "asc"}
+                    ]
+                    if search_after:
+                        pit_query["search_after"] = search_after
+
+                    page_start = time.perf_counter()
+                    response = local_client.search_with_pit_raw(pit_query)
+                    page_duration = time.perf_counter() - page_start
+
+                    hits_root = response.get("hits", {})
+                    hits = hits_root.get("hits", [])
+                    if not isinstance(hits, list):
+                        raise ValueError(
+                            "Unexpected search response: hits.hits is not a list"
+                        )
+                    if not hits:
+                        break
+
+                    payload_bytes = len(json.dumps(response, separators=(",", ":")))
+                    chunks.put(
+                        ExportChunk(
+                            hits=hits,
+                            page_size=local_page_size,
+                            page_duration=page_duration,
+                            payload_bytes=payload_bytes,
+                        )
+                    )
+
+                    search_after = hits[-1].get("sort")
+                    next_pit_id = response.get("pit_id")
+                    if isinstance(next_pit_id, str) and next_pit_id:
+                        pit_id = next_pit_id
+
+                    if adaptive_page_size:
+                        local_page_size = adapt_page_size(
+                            local_page_size,
+                            page_duration,
+                            payload_bytes,
+                            len(hits),
+                            min_page_size=min_page_size,
+                            max_page_size=max_page_size,
+                        )
+        except Exception as e:
+            chunks.put(e)
+            stop_event.set()
+        finally:
+            if pit_id:
+                try:
+                    local_client.close_pit(pit_id)
+                except Exception:
+                    pass
+            chunks.put(None)
+
+    docs_written = 0
+    pages = 0
+    recent_page_size = page_size
+
+    try:
+        with ThreadPoolExecutor(max_workers=resolved_workers) as executor:
+            futures = [
+                executor.submit(worker, worker_id)
+                for worker_id in range(resolved_workers)
+            ]
+
             with Progress(
                 SpinnerColumn(),
                 BarColumn(),
@@ -427,50 +713,50 @@ def export(
                 task = progress.add_task(
                     "Starting...", total=total_docs if total_docs > 0 else None
                 )
+                finished_workers = 0
+                while finished_workers < resolved_workers:
+                    chunk = chunks.get()
+                    if chunk is None:
+                        finished_workers += 1
+                        continue
 
-                while True:
-                    page += 1
-                    if search_after:
-                        pit_query["search_after"] = search_after
+                    if isinstance(chunk, Exception):
+                        with lock:
+                            worker_errors.append(str(chunk))
+                        stop_event.set()
+                        continue
 
-                    search_result = client.search_with_pit(pit_query)
-                    hits = search_result.hit_list
-
-                    if not hits:
-                        break
-
-                    # Stream write for JSONL format
-                    if output_file:
-                        for hit in hits:
-                            output_file.write(json.dumps(hit) + "\n")
-                        output_file.flush()
-                        docs_written += len(hits)
+                    pages += 1
+                    if sink:
+                        sink.write_hits(chunk.hits)
                     else:
-                        all_hits.extend(hits)
+                        all_hits.extend(chunk.hits)
 
-                    current_count = docs_written if output_file else len(all_hits)
+                    docs_written += len(chunk.hits)
+                    recent_page_size = chunk.page_size
                     progress.update(
                         task,
-                        completed=current_count,
-                        description=f"Page {page} • {current_count:,} docs",
+                        completed=docs_written,
+                        description=(
+                            f"Pages {pages} • {docs_written:,} docs"
+                            f" • page_size~{recent_page_size}"
+                        ),
                     )
 
-                    search_after = hits[-1].get("sort")
+            for future in futures:
+                future.result()
+    finally:
+        if sink:
+            sink.close()
 
-                    # Refresh PIT keep-alive
-                    if search_result.pit_id:
-                        pit_query["pit"]["id"] = search_result.pit_id
-        finally:
-            # Step 5: Close PIT and output file
-            client.close_pit(pit_id)
-            if output_file:
-                output_file.close()
+    if worker_errors:
+        console.print(f"[red]Export failed:[/red] {worker_errors[0]}")
+        raise SystemExit(1)
 
     final_count = docs_written if docs_written > 0 else len(all_hits)
     console.print(f"[green]Export complete! Total documents: {final_count:,}[/green]")
 
-    # Write output (only if not already streamed)
-    if not (output and output_format == "jsonl"):
+    if output_format == "json":
         formatted = format_hits(all_hits, output_format)
         write_output(
             formatted,
@@ -494,7 +780,13 @@ def export(
     "-i",
     required=True,
     type=click.Path(exists=True, path_type=Path),
-    help="Path to JSONL export file",
+    help="Path to export file (jsonl or parquet)",
+)
+@click.option(
+    "--input-format",
+    type=click.Choice(["jsonl", "parquet"]),
+    default=None,
+    help="Input format (default: inferred from extension)",
 )
 @click.option(
     "--batch-size",
@@ -520,6 +812,7 @@ def export(
 def import_docs(
     index: str,
     input_file: Path,
+    input_format: str | None,
     batch_size: int,
     refresh: str,
     url: str,
@@ -528,10 +821,11 @@ def import_docs(
     username: str | None,
     password: str | None,
 ) -> None:
-    """Import JSONL hits into Elasticsearch using bulk create operations."""
+    """Import JSONL or Parquet hits into Elasticsearch using bulk create operations."""
     if batch_size <= 0:
         console.print("[red]--batch-size must be greater than 0.[/red]")
         raise SystemExit(1)
+    resolved_input_format = infer_input_format(input_file, input_format)
 
     client = create_client(
         url=url,
@@ -581,6 +875,35 @@ def import_docs(
         batch_lines.clear()
         batch_docs = 0
 
+    def process_hit(hit: Any, line_number: int) -> None:
+        nonlocal total_read, batch_docs
+        if not isinstance(hit, dict):
+            console.print(f"[red]Line {line_number} must be a JSON object.[/red]")
+            raise SystemExit(1)
+
+        total_read += 1
+        doc_id = hit.get("_id")
+        source = hit.get("_source")
+        if not isinstance(doc_id, str):
+            console.print(f"[red]Line {line_number} missing string '_id' field.[/red]")
+            raise SystemExit(1)
+        if not isinstance(source, dict):
+            console.print(
+                f"[red]Line {line_number} missing object '_source' field.[/red]"
+            )
+            raise SystemExit(1)
+
+        batch_lines.append(json.dumps({"create": {"_index": index, "_id": doc_id}}))
+        batch_lines.append(json.dumps(source))
+        batch_docs += 1
+
+        if batch_docs >= batch_size:
+            flush_batch()
+            console.print(
+                f"Processed {total_read:,} docs "
+                f"(created: {created:,}, conflicts: {conflicts:,}, failed: {failed:,})"
+            )
+
     with client.session():
         if not client.index_exists(index):
             console.print(
@@ -589,51 +912,59 @@ def import_docs(
             raise SystemExit(1)
 
         console.print(f"[bold]Starting import into {index}[/bold]")
-        with input_file.open() as f:
-            for line_number, line in enumerate(f, start=1):
-                if not line.strip():
-                    continue
-
-                total_read += 1
-                try:
-                    hit = json.loads(line)
-                except json.JSONDecodeError as e:
-                    console.print(
-                        f"[red]Invalid JSON at line {line_number}:[/red] {e.msg}"
-                    )
-                    raise SystemExit(1)
-
-                if not isinstance(hit, dict):
-                    console.print(
-                        f"[red]Line {line_number} must be a JSON object.[/red]"
-                    )
-                    raise SystemExit(1)
-
-                doc_id = hit.get("_id")
-                source = hit.get("_source")
-                if not isinstance(doc_id, str):
-                    console.print(
-                        f"[red]Line {line_number} missing string '_id' field.[/red]"
-                    )
-                    raise SystemExit(1)
-                if not isinstance(source, dict):
-                    console.print(
-                        f"[red]Line {line_number} missing object '_source' field.[/red]"
-                    )
-                    raise SystemExit(1)
-
-                batch_lines.append(
-                    json.dumps({"create": {"_index": index, "_id": doc_id}})
+        if resolved_input_format == "jsonl":
+            with input_file.open() as f:
+                for line_number, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        hit = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        console.print(
+                            f"[red]Invalid JSON at line {line_number}:[/red] {e.msg}"
+                        )
+                        raise SystemExit(1)
+                    process_hit(hit, line_number)
+        else:
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                console.print(
+                    "[red]Parquet support requires pyarrow. Install with:[/red] "
+                    "[bold]uv sync[/bold]"
                 )
-                batch_lines.append(json.dumps(source))
-                batch_docs += 1
+                raise SystemExit(1)
 
-                if batch_docs >= batch_size:
-                    flush_batch()
-                    console.print(
-                        f"Processed {total_read:,} docs "
-                        f"(created: {created:,}, conflicts: {conflicts:,}, failed: {failed:,})"
-                    )
+            parquet_file = pq.ParquetFile(str(input_file))
+            line_number = 0
+            for batch in parquet_file.iter_batches():
+                batch_rows = batch.to_pylist()
+                for row in batch_rows:
+                    line_number += 1
+                    if not isinstance(row, dict):
+                        console.print("[red]Invalid parquet row format.[/red]")
+                        raise SystemExit(1)
+
+                    hit_json = row.get("hit_json")
+                    if not isinstance(hit_json, str):
+                        console.print(
+                            (
+                                f"[red]Parquet row {line_number} missing string "
+                                "'hit_json'.[/red]"
+                            )
+                        )
+                        raise SystemExit(1)
+                    try:
+                        hit = json.loads(hit_json)
+                    except json.JSONDecodeError as e:
+                        console.print(
+                            (
+                                f"[red]Invalid hit_json at parquet row "
+                                f"{line_number}:[/red] {e.msg}"
+                            )
+                        )
+                        raise SystemExit(1)
+                    process_hit(hit, line_number)
 
         flush_batch()
 

@@ -11,6 +11,7 @@ dependencies = [
   "click>=8.3.1",
   "httpx>=0.28.0",
   "platformdirs>=4.3.0",
+  "pyarrow>=23.0.1",
   "pydantic>=2.0",
   "rich>=14.2.0",
   "rich-click>=1.9.5",
@@ -30,5 +31,7 @@ build-backend = "uv_build"
 dev = [
   "pytest>=9.0.2",
   "pytest-databases>=0.15.1",
+  "ruff>=0.15.2",
+  "ty>=0.0.18",
   "typing-extensions>=4.15.0",
 ]

@@ -84,6 +84,15 @@ elastic-utils search export --index alias-frozen --query-file query.json \
 elastic-utils search export --index alias-frozen --query-file query.json \
   --page-size 500 --keep-alive 15m -o results.jsonl
 
+# Parallel sliced export with adaptive paging
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --workers 4 --adaptive-page-size --min-page-size 500 --max-page-size 4000 \
+  -o results.jsonl
+
+# Streaming parquet export (better compression)
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --format parquet --parquet-compression zstd -o results.parquet
+
 # Export with explicit source credentials (instead of stored auth)
 elastic-utils search export --index alias-frozen --query-file query.json \
   --url http://source-es:9200 --username elastic --password secret \
@@ -101,6 +110,11 @@ elastic-utils search import --index logs-restored --input results.jsonl \
 # API key auth
 elastic-utils search import --index logs-restored --input results.jsonl \
   --url http://dest-es:9200 --api-key-id <id> --api-key <key>
+
+# Import parquet raw-hit export
+elastic-utils search import --index logs-restored --input results.parquet \
+  --input-format parquet \
+  --url http://dest-es:9200 --username elastic --password secret
 ```
 
 Import behavior:
@@ -243,6 +257,8 @@ elastic-utils jsonl extract \
 ```bash
 uv tool install 'git+https://github.com/elohmeier/elastic-utils[xlsx]'
 ```
+
+Parquet export/import is supported by default (pyarrow is installed as a core dependency).
 
 ## Development
 

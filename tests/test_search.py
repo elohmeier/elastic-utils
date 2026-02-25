@@ -10,6 +10,7 @@ from click.testing import CliRunner
 
 from conftest import ElasticsearchSecureService
 from elastic_utils.cli import cli
+from elastic_utils.search import adapt_page_size, infer_input_format
 
 
 @pytest.fixture
@@ -56,6 +57,39 @@ def test_search_help(runner: CliRunner) -> None:
     assert "import" in result.output
 
 
+def test_adapt_page_size_scales_up() -> None:
+    """Adaptive pager should increase page size for fast/small responses."""
+    new_size = adapt_page_size(
+        1000,
+        page_duration=0.3,
+        payload_bytes=2_000_000,
+        returned_hits=1000,
+        min_page_size=250,
+        max_page_size=5000,
+    )
+    assert new_size > 1000
+
+
+def test_adapt_page_size_scales_down() -> None:
+    """Adaptive pager should reduce page size for slow/large responses."""
+    new_size = adapt_page_size(
+        1000,
+        page_duration=3.0,
+        payload_bytes=30_000_000,
+        returned_hits=1000,
+        min_page_size=250,
+        max_page_size=5000,
+    )
+    assert new_size < 1000
+
+
+def test_infer_input_format_from_extension(tmp_path: Path) -> None:
+    """Import format should infer parquet from file extension."""
+    parquet_file = tmp_path / "input.parquet"
+    assert infer_input_format(parquet_file, None) == "parquet"
+    assert infer_input_format(parquet_file, "jsonl") == "jsonl"
+
+
 def test_search_submit_not_authenticated(
     runner: CliRunner, mock_creds_path: Path
 ) -> None:
@@ -63,6 +97,27 @@ def test_search_submit_not_authenticated(
     result = runner.invoke(cli, ["search", "submit", "--index", "test"])
     assert result.exit_code == 1
     assert "Not authenticated" in result.output
+
+
+def test_search_export_parquet_requires_output(runner: CliRunner, tmp_path: Path) -> None:
+    """Parquet export should require file output."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "export",
+            "--index",
+            "source-index",
+            "--query-file",
+            str(query_file),
+            "--format",
+            "parquet",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Parquet export requires --output" in result.output
 
 
 def test_search_submit_no_query(runner: CliRunner, authenticated_creds: Path) -> None:
@@ -518,21 +573,21 @@ def test_search_export_with_explicit_auth(
     poll_result.response.shards = shards
     poll_result.total_hits = 1
 
-    hit_result = MagicMock()
-    hit_result.hit_list = [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
-    hit_result.pit_id = "pit-2"
-
-    empty_result = MagicMock()
-    empty_result.hit_list = []
-    empty_result.pit_id = None
-
     mock_client = MagicMock()
     mock_client.session.return_value.__enter__.return_value = mock_client
     mock_client.session.return_value.__exit__.return_value = None
     mock_client.async_search_submit.return_value.id = "search-id"
     mock_client.async_search_poll.side_effect = [poll_result]
-    mock_client.open_pit.return_value = "pit-1"
-    mock_client.search_with_pit.side_effect = [hit_result, empty_result]
+    mock_client.primary_shard_count.return_value = 1
+    mock_client.search_with_pit_raw.side_effect = [
+        {
+            "hits": {
+                "hits": [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
+            },
+            "pit_id": "pit-2",
+        },
+        {"hits": {"hits": []}},
+    ]
 
     with patch("elastic_utils.search.create_client", return_value=mock_client):
         result = runner.invoke(
@@ -906,3 +961,160 @@ def test_search_export_import_roundtrip_integration(
     assert reimport_result.exit_code == 0
     assert "Created: 0" in reimport_result.output
     assert "Conflicts skipped: 3" in reimport_result.output
+
+
+def test_search_export_import_parquet_roundtrip_integration(
+    runner: CliRunner,
+    mock_creds_path: Path,
+    elasticsearch_secure_service: ElasticsearchSecureService,
+    tmp_path: Path,
+) -> None:
+    """Test parquet export/import roundtrip against real Elasticsearch."""
+    pytest.importorskip("pyarrow")
+
+    url = f"{elasticsearch_secure_service.scheme}://{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
+
+    login_result = runner.invoke(
+        cli,
+        [
+            "auth",
+            "login",
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+        ],
+    )
+    assert login_result.exit_code == 0
+
+    import httpx as real_httpx
+
+    source_index = "transfer-source-parquet-index"
+    dest_index = "transfer-dest-parquet-index"
+
+    for index_name in [source_index, dest_index]:
+        try:
+            real_httpx.delete(
+                f"{url}/{index_name}",
+                auth=(
+                    elasticsearch_secure_service.user,
+                    elasticsearch_secure_service.password,
+                ),
+                timeout=30.0,
+            )
+        except Exception:
+            pass
+
+    mappings = {
+        "mappings": {
+            "properties": {
+                "message": {"type": "text"},
+                "@timestamp": {"type": "date"},
+            }
+        }
+    }
+
+    real_httpx.put(
+        f"{url}/{source_index}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json=mappings,
+        timeout=30.0,
+    )
+    real_httpx.put(
+        f"{url}/{dest_index}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json=mappings,
+        timeout=30.0,
+    )
+
+    expected_ids = ["doc-1", "doc-2", "doc-3"]
+    for i, doc_id in enumerate(expected_ids, start=1):
+        real_httpx.put(
+            f"{url}/{source_index}/_doc/{doc_id}",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            json={
+                "message": f"parquet roundtrip message {i}",
+                "@timestamp": f"2026-01-19T12:00:0{i}Z",
+            },
+            timeout=30.0,
+        )
+
+    real_httpx.post(
+        f"{url}/{source_index}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+    real_httpx.post(
+        f"{url}/{dest_index}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+
+    query_file = tmp_path / "parquet-roundtrip-query.json"
+    query_file.write_text('{"query": {"match_all": {}}}')
+    output_file = tmp_path / "roundtrip-export.parquet"
+
+    export_result = runner.invoke(
+        cli,
+        [
+            "search",
+            "export",
+            "--index",
+            source_index,
+            "--query-file",
+            str(query_file),
+            "--output",
+            str(output_file),
+            "--format",
+            "parquet",
+            "--workers",
+            "2",
+            "--page-size",
+            "2",
+        ],
+    )
+    assert export_result.exit_code == 0
+    assert output_file.exists()
+
+    import_result = runner.invoke(
+        cli,
+        [
+            "search",
+            "import",
+            "--index",
+            dest_index,
+            "--input",
+            str(output_file),
+            "--input-format",
+            "parquet",
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+            "--batch-size",
+            "2",
+            "--refresh",
+            "wait_for",
+        ],
+    )
+    assert import_result.exit_code == 0
+    assert "Created: 3" in import_result.output
+    assert "Conflicts skipped: 0" in import_result.output
+
+    search_response = real_httpx.post(
+        f"{url}/{dest_index}/_search",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json={"size": 10, "query": {"match_all": {}}},
+        timeout=30.0,
+    )
+    search_response.raise_for_status()
+    hits = search_response.json()["hits"]["hits"]
+    restored_ids = sorted(hit["_id"] for hit in hits)
+    assert restored_ids == expected_ids
