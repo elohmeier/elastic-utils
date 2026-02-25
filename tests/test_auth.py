@@ -156,3 +156,68 @@ def test_auth_login_connection_error(runner: CliRunner, mock_creds_path: Path) -
 
     assert result.exit_code == 1
     assert "Connection error" in result.output
+
+
+def test_auth_login_insecure_sets_verify_false(
+    runner: CliRunner, mock_creds_path: Path
+) -> None:
+    """Test login forwards verify=False when --insecure is set."""
+    class MockResponse:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, str]:
+            return {
+                "id": "test-id",
+                "api_key": "test-key",
+                "name": "elastic-utils-cli",
+                "encoded": "abc",
+            }
+
+    mock_response = MockResponse()
+
+    with patch("elastic_utils.auth.httpx.post", return_value=mock_response) as mock_post:
+        result = runner.invoke(
+            cli,
+            [
+                "auth",
+                "login",
+                "--url",
+                "https://localhost:9200",
+                "--username",
+                "user",
+                "--password",
+                "pass",
+                "--insecure",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert mock_post.call_args.kwargs["verify"] is False
+
+
+def test_auth_login_rejects_insecure_and_ca_cert(
+    runner: CliRunner, mock_creds_path: Path, tmp_path: Path
+) -> None:
+    """Test login rejects mutually exclusive TLS options."""
+    ca_cert = tmp_path / "ca.pem"
+    ca_cert.write_text("dummy")
+
+    result = runner.invoke(
+        cli,
+        [
+            "auth",
+            "login",
+            "--url",
+            "https://localhost:9200",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+            "--insecure",
+            "--ca-cert",
+            str(ca_cert),
+        ],
+    )
+    assert result.exit_code == 1
+    assert "either --insecure or --ca-cert" in result.output

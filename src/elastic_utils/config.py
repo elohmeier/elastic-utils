@@ -3,7 +3,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from platformdirs import user_data_dir
 
@@ -15,6 +15,7 @@ class Credentials(TypedDict):
     api_key_id: str
     api_key: str
     created_at: str
+    tls_verify: NotRequired[bool | str]
 
 
 def get_data_dir() -> Path:
@@ -27,7 +28,13 @@ def get_credentials_path() -> Path:
     return get_data_dir() / "credentials.json"
 
 
-def save_credentials(url: str, api_key_id: str, api_key: str) -> Path:
+def save_credentials(
+    url: str,
+    api_key_id: str,
+    api_key: str,
+    *,
+    tls_verify: bool | str = True,
+) -> Path:
     """Save credentials to the data directory."""
     data_dir = get_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -38,6 +45,8 @@ def save_credentials(url: str, api_key_id: str, api_key: str) -> Path:
         "api_key": api_key,
         "created_at": datetime.now().isoformat(),
     }
+    if tls_verify is not True:
+        credentials["tls_verify"] = tls_verify
 
     creds_path = get_credentials_path()
     creds_path.write_text(json.dumps(credentials, indent=2))

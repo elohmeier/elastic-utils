@@ -36,6 +36,24 @@ def test_save_and_load_credentials(tmp_path: Path) -> None:
             assert creds["api_key_id"] == "test-key-id"
             assert creds["api_key"] == "test-api-key"
             assert "created_at" in creds
+            assert "tls_verify" not in creds
+
+
+def test_save_and_load_credentials_with_custom_tls_verify(tmp_path: Path) -> None:
+    """Test saving/loading credentials with custom TLS verification setting."""
+    creds_file = tmp_path / "credentials.json"
+
+    with patch("elastic_utils.config.get_credentials_path", return_value=creds_file):
+        with patch("elastic_utils.config.get_data_dir", return_value=tmp_path):
+            save_credentials(
+                url="https://localhost:9200",
+                api_key_id="test-key-id",
+                api_key="test-api-key",
+                tls_verify=False,
+            )
+            creds = load_credentials()
+            assert creds is not None
+            assert creds["tls_verify"] is False
 
 
 def test_load_credentials_not_found(tmp_path: Path) -> None:

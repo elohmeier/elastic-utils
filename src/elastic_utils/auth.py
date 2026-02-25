@@ -1,5 +1,7 @@
 """Authentication commands for Elasticsearch."""
 
+from pathlib import Path
+
 import click
 import httpx
 from rich.console import Console
@@ -48,9 +50,34 @@ def auth() -> None:
     hide_input=True,
     help="Elasticsearch password",
 )
-def login(url: str, username: str, password: str) -> None:
+@click.option(
+    "--insecure",
+    is_flag=True,
+    help="Disable TLS certificate verification (for self-signed/local clusters).",
+)
+@click.option(
+    "--ca-cert",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to CA certificate bundle for TLS verification.",
+)
+def login(
+    url: str,
+    username: str,
+    password: str,
+    insecure: bool,
+    ca_cert: Path | None,
+) -> None:
     """Authenticate with Elasticsearch and store an API key."""
+    if insecure and ca_cert:
+        console.print("[red]Use either --insecure or --ca-cert, not both.[/red]")
+        raise SystemExit(1)
+
     url = url.rstrip("/")
+    tls_verify: bool | str = True
+    if insecure:
+        tls_verify = False
+    elif ca_cert:
+        tls_verify = str(ca_cert)
 
     console.print(f"Authenticating with [bold]{url}[/bold]...")
 
@@ -63,6 +90,7 @@ def login(url: str, username: str, password: str) -> None:
                 "expiration": "90d",
             },
             timeout=30.0,
+            verify=tls_verify,
         )
         response.raise_for_status()
     except httpx.ConnectError as e:
@@ -75,7 +103,7 @@ def login(url: str, username: str, password: str) -> None:
 
     data = ApiKeyResponse.model_validate(response.json())
 
-    creds_path = save_credentials(url, data.id, data.api_key)
+    creds_path = save_credentials(url, data.id, data.api_key, tls_verify=tls_verify)
     console.print("[green]Successfully authenticated![/green]")
     console.print(f"API key stored at: {creds_path}")
 
@@ -102,4 +130,11 @@ def status() -> None:
     console.print(f"  URL: {creds['url']}")
     console.print(f"  API Key ID: {creds['api_key_id']}")
     console.print(f"  Created: {creds['created_at']}")
+    tls_verify = creds.get("tls_verify", True)
+    if tls_verify is False:
+        console.print("  TLS Verify: disabled (--insecure)")
+    elif isinstance(tls_verify, str):
+        console.print(f"  TLS Verify: CA bundle {tls_verify}")
+    else:
+        console.print("  TLS Verify: system trust store")
     console.print(f"  Credentials file: {get_credentials_path()}")

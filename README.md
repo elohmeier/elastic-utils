@@ -20,6 +20,12 @@ uvx git+https://github.com/elohmeier/elastic-utils <command>
 elastic-utils auth login   # Authenticate and store API key
 elastic-utils auth status  # Show authentication status
 elastic-utils auth logout  # Remove stored credentials
+
+# Self-signed/local TLS endpoints
+elastic-utils auth login --url https://localhost:9200 --username elastic --password secret --insecure
+
+# Preferred: verify with a custom CA bundle
+elastic-utils auth login --url https://localhost:9200 --username elastic --password secret --ca-cert /path/to/ca.pem
 ```
 
 ## Async Search Commands

@@ -64,10 +64,12 @@ class ElasticsearchClient:
         self,
         base_url: str,
         headers: dict[str, str],
+        verify: bool | str = True,
         console: Console | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.headers = headers
+        self.verify = verify
         self.console = console or Console()
         self._client: httpx.Client | None = None
 
@@ -85,8 +87,9 @@ class ElasticsearchClient:
         api_key = creds["api_key"]
         encoded = base64.b64encode(f"{api_key_id}:{api_key}".encode()).decode()
         headers = {"Authorization": f"ApiKey {encoded}"}
+        verify = creds.get("tls_verify", True)
 
-        return cls(creds["url"], headers, console)
+        return cls(creds["url"], headers, verify=verify, console=console)
 
     @classmethod
     def from_auth(
@@ -98,6 +101,7 @@ class ElasticsearchClient:
         username: str | None = None,
         password: str | None = None,
         console: Console | None = None,
+        verify: bool | str = True,
     ) -> Self:
         """Create client from explicit auth options (API key or basic auth)."""
         console = console or Console()
@@ -110,7 +114,7 @@ class ElasticsearchClient:
                 raise SystemExit(1)
             encoded = base64.b64encode(f"{api_key_id}:{api_key}".encode()).decode()
             headers = {"Authorization": f"ApiKey {encoded}"}
-            return cls(url, headers, console)
+            return cls(url, headers, verify=verify, console=console)
 
         if username or password:
             if not (username and password):
@@ -120,7 +124,7 @@ class ElasticsearchClient:
                 raise SystemExit(1)
             encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
             headers = {"Authorization": f"Basic {encoded}"}
-            return cls(url, headers, console)
+            return cls(url, headers, verify=verify, console=console)
 
         console.print(
             "[red]Explicit auth requires API key (--api-key-id/--api-key) or basic auth (--username/--password).[/red]"
@@ -137,6 +141,7 @@ class ElasticsearchClient:
         username: str | None = None,
         password: str | None = None,
         console: Console | None = None,
+        verify: bool | str = True,
     ) -> Self:
         """Create client from explicit auth options, or fallback to stored credentials."""
         has_explicit_auth = any([url, api_key_id, api_key, username, password])
@@ -158,6 +163,7 @@ class ElasticsearchClient:
             username=None if api_key_id and api_key else username,
             password=None if api_key_id and api_key else password,
             console=console,
+            verify=verify,
         )
 
     @contextmanager
@@ -166,6 +172,7 @@ class ElasticsearchClient:
         self._client = httpx.Client(
             base_url=self.base_url,
             headers=self.headers,
+            verify=self.verify,
         )
         try:
             yield self
@@ -224,6 +231,7 @@ class ElasticsearchClient:
                     json=json,
                     content=content,
                     timeout=timeout,
+                    verify=self.verify,
                 )
             response.raise_for_status()
             return response
