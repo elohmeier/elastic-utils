@@ -11,6 +11,7 @@ from queue import Empty, Full, Queue
 from typing import Any
 
 import click
+import httpx
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -483,6 +484,18 @@ def delete(search_id: str) -> None:
     help="PIT keep-alive duration (default: 10m)",
 )
 @click.option(
+    "--request-timeout",
+    default=120.0,
+    type=float,
+    help="Per PIT search request timeout in seconds (default: 120)",
+)
+@click.option(
+    "--max-timeout-retries",
+    default=5,
+    type=int,
+    help="Max retries per PIT page on read timeout (default: 5)",
+)
+@click.option(
     "--from-date",
     help="Start date filter (ISO format, e.g., 2025-01-01)",
 )
@@ -508,6 +521,8 @@ def export(
     parquet_compression: str,
     parquet_row_group_size: int,
     keep_alive: str,
+    request_timeout: float,
+    max_timeout_retries: int,
     from_date: str | None,
     to_date: str | None,
     url: str | None,
@@ -536,6 +551,12 @@ def export(
         raise SystemExit(1)
     if output_format == "parquet" and not output:
         console.print("[red]Parquet export requires --output.[/red]")
+        raise SystemExit(1)
+    if request_timeout <= 0:
+        console.print("[red]--request-timeout must be greater than 0.[/red]")
+        raise SystemExit(1)
+    if max_timeout_retries < 0:
+        console.print("[red]--max-timeout-retries cannot be negative.[/red]")
         raise SystemExit(1)
 
     client = create_client(
@@ -611,6 +632,28 @@ def export(
 
         total_docs = result.total_hits if result else 0
         console.print(f"Initial search complete, total matching docs: {total_docs:,}")
+        if result and result.response.shards.failed > 0:
+            failed = result.response.shards.failed
+            console.print(
+                f"[yellow]Warning:[/yellow] preflight had {failed} failed shards."
+            )
+            failures = result.response.shards.failures
+            for idx, failure in enumerate(failures[:3], start=1):
+                reason = failure.get("reason")
+                reason_type = reason.get("type", "unknown") if isinstance(reason, dict) else "unknown"
+                reason_msg = (
+                    reason.get("reason", "unknown")
+                    if isinstance(reason, dict)
+                    else str(reason)
+                )
+                console.print(
+                    f"[yellow]  shard failure {idx}:[/yellow] "
+                    f"{reason_type}: {reason_msg}"
+                )
+            if len(failures) > 3:
+                console.print(
+                    f"[yellow]  ... plus {len(failures) - 3} more shard failures[/yellow]"
+                )
         client.async_search_delete(async_search_id, silent=True)
 
         shard_count = client.primary_shard_count(index)
@@ -679,9 +722,37 @@ def export(
                     if search_after:
                         pit_query["search_after"] = search_after
 
-                    page_start = time.perf_counter()
-                    response = local_client.search_with_pit_raw(pit_query)
-                    page_duration = time.perf_counter() - page_start
+                    response: dict[str, Any] | None = None
+                    page_duration = 0.0
+                    timeout_failures = 0
+                    while timeout_failures <= max_timeout_retries:
+                        try:
+                            page_start = time.perf_counter()
+                            response = local_client.search_with_pit_raw(
+                                pit_query,
+                                timeout=request_timeout,
+                            )
+                            page_duration = time.perf_counter() - page_start
+                            break
+                        except httpx.ReadTimeout:
+                            timeout_failures += 1
+                            if timeout_failures > max_timeout_retries:
+                                raise RuntimeError(
+                                    "Read timeout while fetching page "
+                                    f"(worker={worker_id}, page_size={local_page_size}, "
+                                    f"retries={max_timeout_retries})."
+                                ) from None
+                            reduced_page_size = max(
+                                min_page_size,
+                                int(local_page_size * 0.5),
+                            )
+                            if reduced_page_size < local_page_size:
+                                local_page_size = reduced_page_size
+                            backoff = min(2**timeout_failures, 10)
+                            time.sleep(backoff)
+
+                    if response is None:
+                        break
 
                     hits_root = response.get("hits", {})
                     hits = hits_root.get("hits", [])

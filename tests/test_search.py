@@ -652,6 +652,74 @@ def test_search_export_with_explicit_auth(
     assert output_file.exists()
 
 
+def test_search_export_retries_read_timeout(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Export should retry PIT page fetches after read timeout."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.jsonl"
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+    shards.failures = []
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 1
+
+    timeout_exc = httpx.ReadTimeout(
+        "timed out",
+        request=httpx.Request("POST", "http://source:9200/_search"),
+    )
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+    mock_client.search_with_pit_raw.side_effect = [
+        timeout_exc,
+        {
+            "hits": {
+                "hits": [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
+            },
+            "pit_id": "pit-2",
+        },
+        {"hits": {"hits": []}},
+    ]
+
+    with (
+        patch("elastic_utils.search.create_client", return_value=mock_client),
+        patch("elastic_utils.search.time.sleep", return_value=None),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--max-timeout-retries",
+                "2",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Export complete" in result.output
+    assert output_file.exists()
+
+
 # Integration tests with real Elasticsearch
 
 

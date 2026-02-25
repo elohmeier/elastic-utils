@@ -22,6 +22,7 @@ class Shards(BaseModel):
     successful: int
     failed: int
     skipped: int = 0  # optional per spec
+    failures: list[dict[str, Any]] = Field(default_factory=list)  # optional per spec
 
 
 # --- Search Response Models ---
