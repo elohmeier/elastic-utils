@@ -172,7 +172,8 @@ class ParquetSink(HitSink):
         table = self._pa.table(
             {
                 "hit_json": self._pa.array(
-                    [row["hit_json"] for row in self._rows], type=self._pa.large_string()
+                    [row["hit_json"] for row in self._rows],
+                    type=self._pa.large_string(),
                 ),
                 "_id": self._pa.array(
                     [row["_id"] for row in self._rows], type=self._pa.string()
@@ -357,13 +358,37 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
     default="jsonl",
     help="Output format (default: jsonl)",
 )
-def get(search_id: str, output: Path | None, output_format: str) -> None:
+@click.option(
+    "--wait-for",
+    default="5s",
+    help="Wait timeout for completion before fetching results (default: 5s)",
+)
+def get(search_id: str, output: Path | None, output_format: str, wait_for: str) -> None:
     """Get the results of an async search."""
     client = ElasticsearchClient.from_credentials(console)
 
-    result = client.async_search_status(search_id)
+    result = client.async_search_status(search_id, wait_for=wait_for)
 
     hits = result.hits
+    if not hits and result.total_hits > 0:
+        if result.is_running:
+            console.print(
+                "[yellow]Search has matching documents but no hits are available "
+                "in this partial response yet.[/yellow]"
+            )
+            console.print(
+                "Try [bold]elastic-utils search wait[/bold] first, "
+                "then [bold]search get[/bold] again."
+            )
+        else:
+            console.print(
+                "[yellow]Search matched documents but returned zero hit "
+                "documents.[/yellow]"
+            )
+            console.print(
+                "This usually means the original query used "
+                '[bold]"size": 0[/bold]. Re-submit with [bold]"size" > 0[/bold].'
+            )
     formatted = format_hits(hits, output_format)
     write_output(
         formatted,
@@ -707,7 +732,9 @@ def export(
     recent_page_size = page_size
 
     executor = ThreadPoolExecutor(max_workers=resolved_workers)
-    futures = [executor.submit(worker, worker_id) for worker_id in range(resolved_workers)]
+    futures = [
+        executor.submit(worker, worker_id) for worker_id in range(resolved_workers)
+    ]
     try:
         with Progress(
             SpinnerColumn(),

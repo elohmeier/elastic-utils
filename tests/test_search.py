@@ -103,7 +103,9 @@ def test_search_submit_not_authenticated(
     assert "Not authenticated" in result.output
 
 
-def test_search_export_parquet_requires_output(runner: CliRunner, tmp_path: Path) -> None:
+def test_search_export_parquet_requires_output(
+    runner: CliRunner, tmp_path: Path
+) -> None:
     """Parquet export should require file output."""
     query_file = tmp_path / "query.json"
     query_file.write_text('{"query":{"match_all":{}}}')
@@ -318,6 +320,34 @@ def test_search_get_json_output(runner: CliRunner, authenticated_creds: Path) ->
     assert output_json[0]["_id"] == "1"
 
 
+def test_search_get_warns_when_total_hits_but_no_docs(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Get should explain empty docs when total hits are present."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
+        "response": {
+            "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+            "took": 10,
+            "timed_out": False,
+            "hits": {
+                "total": {"value": 10000, "relation": "gte"},
+                "hits": [],
+            },
+        },
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(cli, ["search", "get", "test-id", "--format", "json"])
+
+    assert result.exit_code == 0
+    assert "matched documents but returned zero hit documents" in result.output
+    assert "[]" in result.output
+
+
 def test_search_delete_success(runner: CliRunner, authenticated_creds: Path) -> None:
     """Test delete command success."""
     mock_response = MagicMock()
@@ -489,7 +519,10 @@ def test_search_import_non_conflict_failure(
                 "create": {
                     "_id": "1",
                     "status": 400,
-                    "error": {"type": "mapper_parsing_exception", "reason": "bad field"},
+                    "error": {
+                        "type": "mapper_parsing_exception",
+                        "reason": "bad field",
+                    },
                 }
             }
         ]
@@ -1244,6 +1277,4 @@ def test_search_export_interrupt_shutdown_integration(
 
     assert process.returncode != 0
     assert "Exception ignored on threading shutdown" not in output
-    assert (
-        "Interrupt received, stopping workers" in output or "Aborted." in output
-    )
+    assert "Interrupt received, stopping workers" in output or "Aborted." in output
