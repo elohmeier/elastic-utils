@@ -60,6 +60,13 @@ elastic-utils search wait <search-id> --interval 10   # Poll every 10s
 elastic-utils search wait <search-id> --timeout 300   # Timeout after 5 minutes
 ```
 
+### Debug shard failures
+
+```bash
+elastic-utils search debug-shards <search-id>
+elastic-utils search debug-shards <search-id> --wait-for 5s
+```
+
 ### Get results
 
 ```bash

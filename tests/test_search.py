@@ -55,6 +55,7 @@ def test_search_help(runner: CliRunner) -> None:
     assert "submit" in result.output
     assert "status" in result.output
     assert "wait" in result.output
+    assert "debug-shards" in result.output
     assert "get" in result.output
     assert "delete" in result.output
     assert "export" in result.output
@@ -251,6 +252,72 @@ def test_search_status_success(runner: CliRunner, authenticated_creds: Path) -> 
     assert "Complete" in result.output
     assert "10/10" in result.output
     assert "1234ms" in result.output
+
+
+def test_search_debug_shards_with_failures(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Debug-shards command should print shard failure details."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
+        "response": {
+            "_shards": {
+                "total": 10,
+                "successful": 9,
+                "skipped": 0,
+                "failed": 1,
+                "failures": [
+                    {
+                        "index": "logs-0001",
+                        "shard": 3,
+                        "node": "node-a",
+                        "reason": {
+                            "type": "query_shard_exception",
+                            "reason": "No mapping found for [@timestamp] in order to sort on",
+                        },
+                    }
+                ],
+            },
+            "took": 1234,
+            "timed_out": False,
+            "hits": {"hits": []},
+        },
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(cli, ["search", "debug-shards", "test-id"])
+
+    assert result.exit_code == 0
+    assert "Found 1 failed shard(s)" in result.output
+    assert "index=logs-0001 shard=3 node=node-a" in result.output
+    assert "query_shard_exception" in result.output
+
+
+def test_search_debug_shards_no_failures(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Debug-shards command should report clean shard state."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
+        "response": {
+            "_shards": {"total": 10, "successful": 10, "skipped": 0, "failed": 0},
+            "took": 1234,
+            "timed_out": False,
+            "hits": {"hits": []},
+        },
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(cli, ["search", "debug-shards", "test-id"])
+
+    assert result.exit_code == 0
+    assert "No failed shards reported" in result.output
 
 
 def test_search_get_jsonl_output(
@@ -648,6 +715,7 @@ def test_search_export_with_explicit_auth(
         )
 
     assert result.exit_code == 0
+    assert "Async search ID: search-id" in result.output
     assert "Export complete" in result.output
     assert output_file.exists()
 

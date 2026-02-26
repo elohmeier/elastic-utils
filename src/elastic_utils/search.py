@@ -72,6 +72,37 @@ def read_query(query_file: Path | None) -> dict[str, Any]:
         raise SystemExit(1)
 
 
+def print_shard_failures(
+    failures: list[dict[str, Any]],
+    *,
+    limit: int | None = None,
+) -> None:
+    """Print shard failure diagnostics in a readable format."""
+    shown = failures if limit is None else failures[:limit]
+    for idx, failure in enumerate(shown, start=1):
+        index = failure.get("index", "?")
+        shard = failure.get("shard", "?")
+        node = failure.get("node", "?")
+        reason = failure.get("reason")
+        if isinstance(reason, dict):
+            reason_type = reason.get("type", "unknown")
+            reason_msg = reason.get("reason", "unknown")
+        else:
+            reason_type = "unknown"
+            reason_msg = str(reason)
+
+        console.print(
+            f"[yellow]  shard failure {idx}:[/yellow] "
+            f"index={index} shard={shard} node={node}"
+        )
+        console.print(f"[yellow]    reason:[/yellow] {reason_type}: {reason_msg}")
+
+    if limit is not None and len(failures) > limit:
+        console.print(
+            f"[yellow]  ... plus {len(failures) - limit} more shard failures[/yellow]"
+        )
+
+
 @dataclass
 class ExportChunk:
     """Batch of hits produced by a slice worker."""
@@ -280,6 +311,41 @@ def status(search_id: str, wait_for: str | None) -> None:
     console.print(f"  Shards: {format_shards(result.response.shards)}")
     console.print(f"  Took: {result.response.took}ms")
     console.print(f"  Hits returned: {result.total_hits}")
+
+
+@search.command(name="debug-shards")
+@click.argument("search_id")
+@click.option(
+    "--wait-for",
+    default=None,
+    help="Optional wait timeout before fetching status (e.g., 5s)",
+)
+def debug_shards(search_id: str, wait_for: str | None) -> None:
+    """Show shard failure diagnostics for an async search ID."""
+    client = ElasticsearchClient.from_credentials(console)
+    result = client.async_search_status(search_id, wait_for=wait_for)
+
+    status_color = "yellow" if result.is_running else "green"
+    console.print(
+        f"[{status_color}]Status: {'Running' if result.is_running else 'Complete'}[/{status_color}]"
+    )
+    console.print(f"  Partial: {result.is_partial}")
+    console.print(f"  Shards: {format_shards(result.response.shards)}")
+    console.print(f"  Took: {result.response.took}ms")
+
+    failures = result.response.shards.failures
+    failed = result.response.shards.failed
+    if failed <= 0:
+        console.print("[green]No failed shards reported.[/green]")
+        return
+
+    console.print(f"[yellow]Found {failed} failed shard(s).[/yellow]")
+    if not failures:
+        console.print(
+            "[yellow]No detailed failure payload returned by Elasticsearch.[/yellow]"
+        )
+        return
+    print_shard_failures(failures)
 
 
 @search.command()
@@ -601,6 +667,7 @@ def export(
         if not async_search_id:
             console.print("[red]Async search did not return a search ID.[/red]")
             raise SystemExit(1)
+        console.print(f"Async search ID: [bold]{async_search_id}[/bold]")
 
         console.print("Waiting for async search to complete...")
         with Progress(
@@ -638,22 +705,12 @@ def export(
                 f"[yellow]Warning:[/yellow] preflight had {failed} failed shards."
             )
             failures = result.response.shards.failures
-            for idx, failure in enumerate(failures[:3], start=1):
-                reason = failure.get("reason")
-                reason_type = reason.get("type", "unknown") if isinstance(reason, dict) else "unknown"
-                reason_msg = (
-                    reason.get("reason", "unknown")
-                    if isinstance(reason, dict)
-                    else str(reason)
-                )
+            if not failures:
                 console.print(
-                    f"[yellow]  shard failure {idx}:[/yellow] "
-                    f"{reason_type}: {reason_msg}"
+                    "[yellow]No detailed failure payload returned by Elasticsearch.[/yellow]"
                 )
-            if len(failures) > 3:
-                console.print(
-                    f"[yellow]  ... plus {len(failures) - 3} more shard failures[/yellow]"
-                )
+            else:
+                print_shard_failures(failures, limit=3)
         client.async_search_delete(async_search_id, silent=True)
 
         shard_count = client.primary_shard_count(index)
