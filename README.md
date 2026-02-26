@@ -66,6 +66,8 @@ elastic-utils search wait <search-id> --timeout 300   # Timeout after 5 minutes
 elastic-utils search debug-shards <search-id>
 elastic-utils search debug-shards <search-id> --wait-for 5s
 elastic-utils search debug-shards <search-id> --deep
+elastic-utils search debug-shards <search-id> --summary
+elastic-utils search debug-shards <search-id> --output json --summary
 ```
 
 ### Get results

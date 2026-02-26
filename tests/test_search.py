@@ -320,6 +320,99 @@ def test_search_debug_shards_no_failures(
     assert "No failed shards reported" in result.output
 
 
+def test_search_debug_shards_summary_text(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Debug-shards summary mode should print grouped counts."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
+        "response": {
+            "_shards": {
+                "total": 10,
+                "successful": 8,
+                "skipped": 0,
+                "failed": 2,
+                "failures": [
+                    {
+                        "index": "logs-0001",
+                        "shard": 1,
+                        "node": "node-a",
+                        "reason": {"type": "i_o_exception", "reason": "cache read"},
+                    },
+                    {
+                        "index": "logs-0002",
+                        "shard": 2,
+                        "node": "node-a",
+                        "reason": {"type": "i_o_exception", "reason": "cache read"},
+                    },
+                ],
+            },
+            "took": 1234,
+            "timed_out": False,
+            "hits": {"hits": []},
+        },
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(cli, ["search", "debug-shards", "test-id", "--summary"])
+
+    assert result.exit_code == 0
+    assert "Failure Summary" in result.output
+    assert "by_reason_type" in result.output
+    assert "i_o_exception: 2" in result.output
+    assert "node-a: 2" in result.output
+
+
+def test_search_debug_shards_json_output(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Debug-shards JSON output should return machine-readable diagnostics."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
+        "response": {
+            "_shards": {
+                "total": 10,
+                "successful": 9,
+                "skipped": 0,
+                "failed": 1,
+                "failures": [
+                    {
+                        "index": "logs-0001",
+                        "shard": 3,
+                        "node": "node-a",
+                        "reason": {
+                            "type": "query_shard_exception",
+                            "reason": "bad query",
+                        },
+                    }
+                ],
+            },
+            "took": 1234,
+            "timed_out": False,
+            "hits": {"hits": []},
+        },
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(
+            cli,
+            ["search", "debug-shards", "test-id", "--output", "json", "--summary"],
+        )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["search_id"] == "test-id"
+    assert payload["status"] == "complete"
+    assert payload["shards"]["failed"] == 1
+    assert payload["summary"]["by_reason_type"]["query_shard_exception"] == 1
+
+
 def test_search_debug_shards_deep_fetches_extra_diagnostics(
     runner: CliRunner, authenticated_creds: Path
 ) -> None:
