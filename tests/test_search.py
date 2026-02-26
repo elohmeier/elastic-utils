@@ -788,6 +788,122 @@ def test_search_export_retries_read_timeout(
     assert output_file.exists()
 
 
+def test_search_export_fails_on_preflight_shard_failures_by_default(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Export should fail by default when preflight has failed shards."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+
+    shards = MagicMock()
+    shards.total = 10
+    shards.successful = 9
+    shards.skipped = 0
+    shards.failed = 1
+    shards.failures = [
+        {
+            "index": "logs-0001",
+            "shard": 1,
+            "node": "node-a",
+            "reason": {"type": "i_o_exception", "reason": "cache read failed"},
+        }
+    ]
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 100
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "preflight shard failures detected" in result.output
+    mock_client.primary_shard_count.assert_not_called()
+
+
+def test_search_export_allows_preflight_shard_failures_when_requested(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Export should continue when --allow-shard-failures is set."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.jsonl"
+
+    shards = MagicMock()
+    shards.total = 10
+    shards.successful = 9
+    shards.skipped = 0
+    shards.failed = 1
+    shards.failures = [
+        {
+            "index": "logs-0001",
+            "shard": 1,
+            "node": "node-a",
+            "reason": {"type": "i_o_exception", "reason": "cache read failed"},
+        }
+    ]
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 1
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+    mock_client.search_with_pit_raw.side_effect = [
+        {
+            "hits": {
+                "hits": [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
+            },
+            "pit_id": "pit-2",
+        },
+        {"hits": {"hits": []}},
+    ]
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--allow-shard-failures",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Export complete" in result.output
+    assert output_file.exists()
+
+
 def test_search_export_interrupt_preflight_cancels_async_search(
     runner: CliRunner,
     tmp_path: Path,

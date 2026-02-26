@@ -572,6 +572,13 @@ def delete(search_id: str) -> None:
     help="Max retries per PIT page on read timeout (default: 5)",
 )
 @click.option(
+    "--fail-on-shard-failures/--allow-shard-failures",
+    default=True,
+    help=(
+        "Fail export when preflight async search reports failed shards (default: fail)"
+    ),
+)
+@click.option(
     "--from-date",
     help="Start date filter (ISO format, e.g., 2025-01-01)",
 )
@@ -599,6 +606,7 @@ def export(
     keep_alive: str,
     request_timeout: float,
     max_timeout_retries: int,
+    fail_on_shard_failures: bool,
     from_date: str | None,
     to_date: str | None,
     url: str | None,
@@ -737,6 +745,13 @@ def export(
                 )
             else:
                 print_shard_failures(failures, limit=3)
+            if fail_on_shard_failures:
+                client.async_search_delete(async_search_id, silent=True)
+                console.print(
+                    "[red]Export failed:[/red] preflight shard failures detected. "
+                    "Re-run with [bold]--allow-shard-failures[/bold] to continue."
+                )
+                raise SystemExit(1)
         client.async_search_delete(async_search_id, silent=True)
 
         shard_count = client.primary_shard_count(index)

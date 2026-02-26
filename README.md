@@ -97,6 +97,11 @@ elastic-utils search export --index alias-frozen --query-file query.json \
 elastic-utils search export --index alias-frozen --query-file query.json \
   --page-size 500 --keep-alive 15m -o results.jsonl
 
+# By default, export fails if preflight reports shard failures.
+# Override only when partial results are acceptable:
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --allow-shard-failures -o results.jsonl
+
 # Parallel sliced export with adaptive paging
 elastic-utils search export --index alias-frozen --query-file query.json \
   --workers 4 --adaptive-page-size --min-page-size 500 --max-page-size 4000 \
