@@ -788,6 +788,82 @@ def test_search_export_retries_read_timeout(
     assert output_file.exists()
 
 
+def test_search_export_interrupt_preflight_cancels_async_search(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C during preflight wait should cancel async search when chosen."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = KeyboardInterrupt()
+
+    with (
+        patch("elastic_utils.search.create_client", return_value=mock_client),
+        patch(
+            "elastic_utils.search.should_cancel_async_search_on_interrupt",
+            return_value=True,
+        ),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+            ],
+        )
+
+    assert result.exit_code == 130
+    mock_client.async_search_delete.assert_called_once_with("search-id", silent=True)
+    assert "canceled async search" in result.output
+
+
+def test_search_export_interrupt_preflight_keeps_async_search_when_declined(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C during preflight wait may leave async search running by choice."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = KeyboardInterrupt()
+
+    with (
+        patch("elastic_utils.search.create_client", return_value=mock_client),
+        patch(
+            "elastic_utils.search.should_cancel_async_search_on_interrupt",
+            return_value=False,
+        ),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+            ],
+        )
+
+    assert result.exit_code == 130
+    mock_client.async_search_delete.assert_not_called()
+    assert "leaving async search running" in result.output
+
+
 # Integration tests with real Elasticsearch
 
 

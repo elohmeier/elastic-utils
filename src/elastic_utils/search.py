@@ -103,6 +103,16 @@ def print_shard_failures(
         )
 
 
+def should_cancel_async_search_on_interrupt() -> bool:
+    """Decide whether to cancel a preflight async search after Ctrl-C."""
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return True
+    return click.confirm(
+        "Cancel async search on Elasticsearch before exiting?",
+        default=True,
+    )
+
+
 @dataclass
 class ExportChunk:
     """Batch of hits produced by a slice worker."""
@@ -659,6 +669,7 @@ def export(
 
     console.print(f"[bold]Starting export from {index}[/bold]")
     with client.session():
+        result = None
         console.print("Running initial async search...")
         initial_result = client.async_search_submit(
             index, query, wait_for="1s", keep_alive="1h"
@@ -670,32 +681,47 @@ def export(
         console.print(f"Async search ID: [bold]{async_search_id}[/bold]")
 
         console.print("Waiting for async search to complete...")
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total} shards"),
-            TimeElapsedColumn(),
-            TextColumn("eta"),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("", total=None)
-            while True:
-                result = client.async_search_poll(async_search_id)
-                if result is None:
-                    break
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total} shards"),
+                TimeElapsedColumn(),
+                TextColumn("eta"),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("", total=None)
+                while True:
+                    result = client.async_search_poll(async_search_id)
+                    if result is None:
+                        break
 
-                shards = result.response.shards
-                progress.update(
-                    task,
-                    total=shards.total,
-                    completed=shards.successful,
-                    description=f"(skipped: {shards.skipped}, failed: {shards.failed})",
+                    shards = result.response.shards
+                    progress.update(
+                        task,
+                        total=shards.total,
+                        completed=shards.successful,
+                        description=(
+                            f"(skipped: {shards.skipped}, failed: {shards.failed})"
+                        ),
+                    )
+                    if not result.is_running:
+                        break
+                    time.sleep(5)
+        except KeyboardInterrupt:
+            if should_cancel_async_search_on_interrupt():
+                client.async_search_delete(async_search_id, silent=True)
+                console.print(
+                    "\n[yellow]Interrupt received, canceled async search.[/yellow]"
                 )
-                if not result.is_running:
-                    break
-                time.sleep(5)
+            else:
+                console.print(
+                    "\n[yellow]Interrupt received, leaving async search running "
+                    "(will expire by keep_alive).[/yellow]"
+                )
+            raise SystemExit(130)
 
         total_docs = result.total_hits if result else 0
         console.print(f"Initial search complete, total matching docs: {total_docs:,}")
