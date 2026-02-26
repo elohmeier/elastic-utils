@@ -103,6 +103,134 @@ def print_shard_failures(
         )
 
 
+def _format_bytes(value: Any) -> str:
+    """Format byte counts for compact diagnostics."""
+    if not isinstance(value, (int, float)) or value < 0:
+        return "?"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    size = float(value)
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024
+        idx += 1
+    return f"{size:.1f}{units[idx]}"
+
+
+def print_failed_shard_allocation_debug(
+    client: ElasticsearchClient, failures: list[dict[str, Any]]
+) -> None:
+    """Show current shard routing state for failed shard entries."""
+    failed_targets: dict[str, set[str]] = {}
+    for failure in failures:
+        index = failure.get("index")
+        shard = failure.get("shard")
+        if not isinstance(index, str) or shard is None:
+            continue
+        failed_targets.setdefault(index, set()).add(str(shard))
+
+    if not failed_targets:
+        console.print(
+            "[yellow]Could not infer index/shard targets from failure details.[/yellow]"
+        )
+        return
+
+    console.print("[bold]Failed Shard Routing[/bold]")
+    for index, failed_shards in sorted(failed_targets.items()):
+        try:
+            response = client.get(
+                f"/_cat/shards/{index}",
+                params={
+                    "format": "json",
+                    "h": "index,shard,prirep,state,node,unassigned.reason",
+                },
+            )
+        except SystemExit:
+            console.print(
+                f"[yellow]  Unable to fetch shard routing for index {index}.[/yellow]"
+            )
+            continue
+        if response is None:
+            continue
+
+        rows = response.json()
+        matching_rows = [
+            row
+            for row in rows
+            if isinstance(row, dict) and row.get("shard") in failed_shards
+        ]
+        if not matching_rows:
+            console.print(
+                f"[yellow]  No matching shard rows found for index={index}.[/yellow]"
+            )
+            continue
+
+        for row in matching_rows:
+            shard = row.get("shard", "?")
+            prirep = row.get("prirep", "?")
+            state = row.get("state", "?")
+            node = row.get("node", "?")
+            unassigned = row.get("unassigned.reason") or "-"
+            console.print(
+                f"  index={index} shard={shard}{prirep} "
+                f"state={state} node={node} unassigned={unassigned}"
+            )
+
+
+def print_node_diagnostics(
+    client: ElasticsearchClient, failures: list[dict[str, Any]]
+) -> None:
+    """Show key node stats for nodes implicated in shard failures."""
+    nodes = sorted(
+        {
+            node
+            for node in (failure.get("node") for failure in failures)
+            if isinstance(node, str) and node
+        }
+    )
+    if not nodes:
+        console.print("[yellow]No node IDs present in shard failure details.[/yellow]")
+        return
+
+    console.print("[bold]Impacted Node Stats[/bold]")
+    for node_id in nodes:
+        try:
+            response = client.get(f"/_nodes/{node_id}/stats/fs,indices,thread_pool")
+        except SystemExit:
+            console.print(
+                f"[yellow]  Unable to fetch node stats for node={node_id}.[/yellow]"
+            )
+            continue
+        if response is None:
+            continue
+
+        payload = response.json()
+        nodes_payload = payload.get("nodes", {})
+        if not isinstance(nodes_payload, dict) or not nodes_payload:
+            console.print(f"[yellow]  No node payload for node={node_id}.[/yellow]")
+            continue
+
+        node = next(iter(nodes_payload.values()))
+        if not isinstance(node, dict):
+            console.print(
+                f"[yellow]  Unexpected node payload format for {node_id}.[/yellow]"
+            )
+            continue
+
+        node_name = node.get("name", node_id)
+        fs_total = node.get("fs", {}).get("total", {})
+        indices_search = node.get("indices", {}).get("search", {})
+        tp_search = node.get("thread_pool", {}).get("search", {})
+        console.print(
+            "  "
+            f"node={node_name} ({node_id}) "
+            f"disk_avail={_format_bytes(fs_total.get('available_in_bytes'))} "
+            f"disk_total={_format_bytes(fs_total.get('total_in_bytes'))} "
+            f"search_q={tp_search.get('queue', '?')} "
+            f"search_rejected={tp_search.get('rejected', '?')} "
+            f"query_total={indices_search.get('query_total', '?')}"
+        )
+
+
 def should_cancel_async_search_on_interrupt() -> bool:
     """Decide whether to cancel a preflight async search after Ctrl-C."""
     if not (sys.stdin.isatty() and sys.stderr.isatty()):
@@ -330,7 +458,12 @@ def status(search_id: str, wait_for: str | None) -> None:
     default=None,
     help="Optional wait timeout before fetching status (e.g., 5s)",
 )
-def debug_shards(search_id: str, wait_for: str | None) -> None:
+@click.option(
+    "--deep/--no-deep",
+    default=False,
+    help=("Fetch extra diagnostics (failed shard routing and impacted node stats)."),
+)
+def debug_shards(search_id: str, wait_for: str | None, deep: bool) -> None:
     """Show shard failure diagnostics for an async search ID."""
     client = ElasticsearchClient.from_credentials(console)
     result = client.async_search_status(search_id, wait_for=wait_for)
@@ -356,6 +489,9 @@ def debug_shards(search_id: str, wait_for: str | None) -> None:
         )
         return
     print_shard_failures(failures)
+    if deep:
+        print_failed_shard_allocation_debug(client, failures)
+        print_node_diagnostics(client, failures)
 
 
 @search.command()

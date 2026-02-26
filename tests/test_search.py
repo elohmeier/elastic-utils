@@ -320,6 +320,86 @@ def test_search_debug_shards_no_failures(
     assert "No failed shards reported" in result.output
 
 
+def test_search_debug_shards_deep_fetches_extra_diagnostics(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Debug-shards deep mode should fetch routing and node diagnostics."""
+    status_response = MagicMock()
+    status_response.json.return_value = {
+        "id": "test-id",
+        "is_running": False,
+        "is_partial": False,
+        "response": {
+            "_shards": {
+                "total": 10,
+                "successful": 9,
+                "skipped": 0,
+                "failed": 1,
+                "failures": [
+                    {
+                        "index": "logs-0001",
+                        "shard": 3,
+                        "node": "node-a",
+                        "reason": {
+                            "type": "i_o_exception",
+                            "reason": "cache read failed",
+                        },
+                    }
+                ],
+            },
+            "took": 1234,
+            "timed_out": False,
+            "hits": {"hits": []},
+        },
+    }
+    shard_response = MagicMock()
+    shard_response.json.return_value = [
+        {
+            "index": "logs-0001",
+            "shard": "3",
+            "prirep": "p",
+            "state": "STARTED",
+            "node": "node-a",
+            "unassigned.reason": "",
+        }
+    ]
+    node_response = MagicMock()
+    node_response.json.return_value = {
+        "nodes": {
+            "node-a": {
+                "name": "data-hot-1",
+                "fs": {
+                    "total": {
+                        "available_in_bytes": 1073741824,
+                        "total_in_bytes": 2147483648,
+                    }
+                },
+                "indices": {"search": {"query_total": 123}},
+                "thread_pool": {"search": {"queue": 4, "rejected": 2}},
+            }
+        }
+    }
+
+    def _mock_request(*args, **kwargs):
+        url = kwargs.get("url") or (args[1] if len(args) > 1 else "")
+        if url.endswith("/_async_search/test-id"):
+            return status_response
+        if url.endswith("/_cat/shards/logs-0001"):
+            return shard_response
+        if url.endswith("/_nodes/node-a/stats/fs,indices,thread_pool"):
+            return node_response
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    with patch("elastic_utils.client.httpx.request", side_effect=_mock_request):
+        result = runner.invoke(cli, ["search", "debug-shards", "test-id", "--deep"])
+
+    assert result.exit_code == 0
+    assert "Failed Shard Routing" in result.output
+    assert "index=logs-0001 shard=3p state=STARTED node=node-a" in result.output
+    assert "Impacted Node Stats" in result.output
+    assert "node=data-hot-1 (node-a)" in result.output
+
+
 def test_search_get_jsonl_output(
     runner: CliRunner, authenticated_creds: Path, tmp_path: Path
 ) -> None:
