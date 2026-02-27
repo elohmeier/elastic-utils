@@ -406,6 +406,8 @@ class ElasticsearchClient:
         self,
         index: str,
         query: dict[str, Any] | None = None,
+        *,
+        timeout: float = 120.0,
     ) -> CountResponse:
         """Count documents matching a query."""
         body: dict[str, Any] = {}
@@ -414,7 +416,7 @@ class ElasticsearchClient:
         response = self.post(
             f"/{index}/_count",
             json=body,
-            timeout=60.0,
+            timeout=timeout,
         )
         assert response is not None
         return CountResponse.model_validate(response.json())

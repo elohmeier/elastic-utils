@@ -563,13 +563,26 @@ def submit(index: str, query_file: Path | None, wait_for: str, keep_alive: str) 
     type=click.Path(exists=True, path_type=Path),
     help="Path to JSON file containing the query",
 )
-def count(index: str, query_file: Path | None) -> None:
+@click.option(
+    "--request-timeout",
+    default=120.0,
+    type=float,
+    help="Request timeout in seconds (default: 120)",
+)
+def count(index: str, query_file: Path | None, request_timeout: float) -> None:
     """Count documents matching a query."""
     client = ElasticsearchClient.from_credentials(console)
     query_body = read_query(query_file) if query_file else None
     query_clause = query_body.get("query") if query_body else None
 
-    result = client.count(index, query=query_clause)
+    try:
+        result = client.count(index, query=query_clause, timeout=request_timeout)
+    except httpx.TimeoutException:
+        console.print(
+            f"[red]Request timed out after {request_timeout:.0f}s.[/red] "
+            "Try increasing [bold]--request-timeout[/bold]."
+        )
+        raise SystemExit(1)
 
     console.print(f"Count: [bold]{result.count:,}[/bold]")
     console.print(f"  Shards: {format_shards(result.shards)}")

@@ -276,6 +276,21 @@ def test_search_count_not_authenticated(
     assert "Not authenticated" in result.output
 
 
+def test_search_count_timeout(runner: CliRunner, authenticated_creds: Path) -> None:
+    """Test count command handles timeout gracefully."""
+    with patch("elastic_utils.client.httpx.request") as mock_request:
+        mock_request.side_effect = httpx.ReadTimeout("timed out")
+
+        result = runner.invoke(
+            cli,
+            ["search", "count", "--index", "test-index", "--request-timeout", "10"],
+        )
+
+    assert result.exit_code == 1
+    assert "timed out" in result.output.lower()
+    assert "--request-timeout" in result.output
+
+
 def test_search_status_not_found(runner: CliRunner, authenticated_creds: Path) -> None:
     """Test status command for non-existent search."""
     mock_response = MagicMock()
