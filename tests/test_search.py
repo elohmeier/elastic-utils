@@ -53,6 +53,7 @@ def test_search_help(runner: CliRunner) -> None:
     result = runner.invoke(cli, ["search", "--help"])
     assert result.exit_code == 0
     assert "submit" in result.output
+    assert "count" in result.output
     assert "status" in result.output
     assert "wait" in result.output
     assert "debug-shards" in result.output
@@ -213,6 +214,66 @@ def test_search_submit_invalid_json(
 
     assert result.exit_code == 1
     assert "Invalid JSON" in result.output
+
+
+def test_search_count_with_query_file(
+    runner: CliRunner, authenticated_creds: Path, tmp_path: Path
+) -> None:
+    """Test count command with a query file."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query": {"match_all": {}}, "size": 10}')
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "count": 42,
+        "_shards": {"total": 5, "successful": 5, "skipped": 0, "failed": 0},
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "count",
+                "--index",
+                "test-index",
+                "--query-file",
+                str(query_file),
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "42" in result.output
+    assert "5/5" in result.output
+
+
+def test_search_count_without_query(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Test count command without query file (match_all)."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "count": 1000,
+        "_shards": {"total": 3, "successful": 3, "skipped": 0, "failed": 0},
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(
+            cli,
+            ["search", "count", "--index", "test-index"],
+        )
+
+    assert result.exit_code == 0
+    assert "1,000" in result.output
+
+
+def test_search_count_not_authenticated(
+    runner: CliRunner, mock_creds_path: Path
+) -> None:
+    """Test count command when not authenticated."""
+    result = runner.invoke(cli, ["search", "count", "--index", "test"])
+    assert result.exit_code == 1
+    assert "Not authenticated" in result.output
 
 
 def test_search_status_not_found(runner: CliRunner, authenticated_creds: Path) -> None:
@@ -1216,6 +1277,95 @@ def test_search_submit_integration(
 
     assert result.exit_code == 0
     assert "Search submitted" in result.output
+
+
+def test_search_count_integration(
+    runner: CliRunner,
+    mock_creds_path: Path,
+    elasticsearch_secure_service: ElasticsearchSecureService,
+    tmp_path: Path,
+) -> None:
+    """Test count command against real Elasticsearch."""
+    url = f"{elasticsearch_secure_service.scheme}://{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
+
+    login_result = runner.invoke(
+        cli,
+        [
+            "auth",
+            "login",
+            "--url",
+            url,
+            "--username",
+            elasticsearch_secure_service.user,
+            "--password",
+            elasticsearch_secure_service.password,
+        ],
+    )
+    assert login_result.exit_code == 0
+
+    import httpx as real_httpx
+
+    index_name = "count-test-index"
+    try:
+        real_httpx.delete(
+            f"{url}/{index_name}",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            timeout=30.0,
+        )
+    except Exception:
+        pass
+
+    real_httpx.put(
+        f"{url}/{index_name}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json={"mappings": {"properties": {"message": {"type": "text"}}}},
+        timeout=30.0,
+    )
+
+    for i in range(3):
+        real_httpx.post(
+            f"{url}/{index_name}/_doc",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            json={"message": f"count document {i}"},
+            timeout=30.0,
+        )
+
+    real_httpx.post(
+        f"{url}/{index_name}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+
+    # Count all docs (no query file)
+    result = runner.invoke(
+        cli,
+        ["search", "count", "--index", index_name],
+    )
+    assert result.exit_code == 0
+    assert "3" in result.output
+
+    # Count with query file
+    query_file = tmp_path / "count-query.json"
+    query_file.write_text('{"query": {"match": {"message": "count document 0"}}}')
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "count",
+            "--index",
+            index_name,
+            "--query-file",
+            str(query_file),
+        ],
+    )
+    assert result.exit_code == 0
+    assert "1" in result.output
 
 
 def test_search_export_integration(

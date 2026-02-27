@@ -26,6 +26,7 @@ from rich.progress import (
 
 from .client import ElasticsearchClient
 from .formatting import format_hits, format_shards, write_output
+from .models import TotalHits
 
 console = Console()
 
@@ -552,6 +553,29 @@ def submit(index: str, query_file: Path | None, wait_for: str, keep_alive: str) 
 
 
 @search.command()
+@click.option(
+    "--index",
+    required=True,
+    help="Index or alias to search",
+)
+@click.option(
+    "--query-file",
+    type=click.Path(exists=True, path_type=Path),
+    help="Path to JSON file containing the query",
+)
+def count(index: str, query_file: Path | None) -> None:
+    """Count documents matching a query."""
+    client = ElasticsearchClient.from_credentials(console)
+    query_body = read_query(query_file) if query_file else None
+    query_clause = query_body.get("query") if query_body else None
+
+    result = client.count(index, query=query_clause)
+
+    console.print(f"Count: [bold]{result.count:,}[/bold]")
+    console.print(f"  Shards: {format_shards(result.shards)}")
+
+
+@search.command()
 @click.argument("search_id")
 @click.option(
     "--wait-for",
@@ -1056,7 +1080,25 @@ def export(
             raise SystemExit(130)
 
         total_docs = result.total_hits if result else 0
-        console.print(f"Initial search complete, total matching docs: {total_docs:,}")
+        total_hits_obj = result.response.hits.total if result else None
+        if total_hits_obj is None:
+            console.print("Initial search complete, total matching docs: unknown")
+            console.print(
+                '[yellow]Hint:[/yellow] add [bold]"track_total_hits": true[/bold] '
+                "to your query for a progress bar with ETA."
+            )
+        elif isinstance(total_hits_obj, TotalHits) and total_hits_obj.relation == "gte":
+            console.print(
+                f"Initial search complete, total matching docs: >= {total_docs:,}"
+            )
+            console.print(
+                '[yellow]Hint:[/yellow] add [bold]"track_total_hits": true[/bold] '
+                "to your query for an accurate progress bar."
+            )
+        else:
+            console.print(
+                f"Initial search complete, total matching docs: {total_docs:,}"
+            )
         if result and result.response.shards.failed > 0:
             failed = result.response.shards.failed
             console.print(

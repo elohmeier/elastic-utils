@@ -17,6 +17,7 @@ from .models import (
     AliasInfo,
     AsyncSearchResponse,
     ClusterInfo,
+    CountResponse,
     DateRangeResponse,
     ILMExplainResponse,
     IndexAliases,
@@ -400,6 +401,23 @@ class ElasticsearchClient:
             status_handlers=handlers,
         )
         return response is not None
+
+    def count(
+        self,
+        index: str,
+        query: dict[str, Any] | None = None,
+    ) -> CountResponse:
+        """Count documents matching a query."""
+        body: dict[str, Any] = {}
+        if query is not None:
+            body["query"] = query
+        response = self.post(
+            f"/{index}/_count",
+            json=body,
+            timeout=60.0,
+        )
+        assert response is not None
+        return CountResponse.model_validate(response.json())
 
     def open_pit(self, index: str, keep_alive: str = "10m") -> str:
         """Open a Point-in-Time and return its ID."""

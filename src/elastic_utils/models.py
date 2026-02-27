@@ -93,6 +93,18 @@ class AsyncSearchResponse(BaseModel):
         return self.response.hits.total_count
 
 
+class CountResponse(BaseModel):
+    """Response from count API.
+
+    Spec: Response in _global/count/CountResponse.ts
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    count: int
+    shards: Shards = Field(alias="_shards")
+
+
 class PITResponse(BaseModel):
     """Response from Point-in-Time open API.
 
