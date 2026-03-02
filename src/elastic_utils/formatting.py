@@ -35,7 +35,9 @@ def format_compact_number(value: int) -> str:
                 rendered = f"{scaled:.1f}"
             else:
                 rendered = f"{scaled:.2f}"
-            return f"{rendered.rstrip('0').rstrip('.')}{suffix}"
+            if "." in rendered:
+                rendered = rendered.rstrip("0").rstrip(".")
+            return f"{rendered}{suffix}"
     return str(value)
 
 

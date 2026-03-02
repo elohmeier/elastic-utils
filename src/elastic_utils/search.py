@@ -10,7 +10,7 @@ import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -217,6 +217,516 @@ def _format_bytes(value: Any) -> str:
         size /= 1024
         idx += 1
     return f"{size:.1f}{units[idx]}"
+
+
+def _coerce_int(value: Any) -> int | None:
+    """Best-effort conversion for numeric fields returned by cat/nodes APIs."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped == "-":
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_cat_store_bytes(value: Any) -> int:
+    """Parse _cat store-size strings (for example 5.1tb) into bytes."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return 0
+    raw = value.strip().lower()
+    if not raw or raw == "-":
+        return 0
+    suffixes = {
+        "b": 1,
+        "kb": 1024,
+        "mb": 1024**2,
+        "gb": 1024**3,
+        "tb": 1024**4,
+        "pb": 1024**5,
+    }
+    for suffix in ("pb", "tb", "gb", "mb", "kb", "b"):
+        if raw.endswith(suffix):
+            number = raw[: -len(suffix)].strip()
+            try:
+                return int(float(number) * suffixes[suffix])
+            except ValueError:
+                return 0
+    try:
+        return int(float(raw))
+    except ValueError:
+        return 0
+
+
+def _infer_tier_from_name(value: str) -> str:
+    """Infer a rough tier label from node/index naming."""
+    label = value.lower()
+    if "frozen" in label:
+        return "frozen"
+    if "cold" in label:
+        return "cold"
+    if "warm" in label:
+        return "warm"
+    if "hot" in label:
+        return "hot"
+    if "content" in label:
+        return "content"
+    return "unknown"
+
+
+def _infer_tier_from_preference(tier_pref: str | None) -> str:
+    """Infer tier from _tier_preference values like data_hot,data_warm."""
+    if not tier_pref:
+        return "unknown"
+    for part in tier_pref.split(","):
+        normalized = part.strip().lower()
+        if normalized.startswith("data_"):
+            return _infer_tier_from_name(normalized.removeprefix("data_"))
+    return _infer_tier_from_name(tier_pref)
+
+
+def _age_bucket(days: int | None) -> str:
+    """Map an age in days to coarse ranges."""
+    if days is None:
+        return "unknown"
+    if days <= 7:
+        return "0-7d"
+    if days <= 30:
+        return "8-30d"
+    if days <= 90:
+        return "31-90d"
+    if days <= 180:
+        return "91-180d"
+    if days <= 365:
+        return "181-365d"
+    return ">365d"
+
+
+def _month_start(dt: datetime) -> datetime:
+    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_month_start(dt: datetime) -> datetime:
+    if dt.month == 12:
+        return dt.replace(
+            year=dt.year + 1,
+            month=1,
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    return dt.replace(
+        month=dt.month + 1,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _week_start(dt: datetime) -> datetime:
+    start = dt - timedelta(days=dt.weekday())
+    return start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _next_week_start(dt: datetime) -> datetime:
+    return dt + timedelta(days=7)
+
+
+def collect_export_diagnostics(
+    client: ElasticsearchClient, index: str
+) -> dict[str, Any]:
+    """Collect shard allocation and node-search pressure diagnostics for exports."""
+    shards_response = client.get(
+        f"/_cat/shards/{index}",
+        params={
+            "format": "json",
+            "bytes": "b",
+            "h": "index,shard,prirep,state,node,docs,store",
+        },
+        timeout=60.0,
+    )
+    assert shards_response is not None
+    shard_rows_raw = shards_response.json()
+    if not isinstance(shard_rows_raw, list):
+        shard_rows_raw = []
+    shard_rows = [row for row in shard_rows_raw if isinstance(row, dict)]
+
+    node_response = client.get(
+        "/_nodes/stats/indices,thread_pool",
+        params={
+            "filter_path": (
+                "nodes.*.name,nodes.*.roles,nodes.*.indices.search.query_total,"
+                "nodes.*.indices.search.query_time_in_millis,"
+                "nodes.*.indices.search.fetch_total,"
+                "nodes.*.indices.search.fetch_time_in_millis,"
+                "nodes.*.thread_pool.search.queue,nodes.*.thread_pool.search.rejected"
+            )
+        },
+        timeout=60.0,
+    )
+    assert node_response is not None
+    nodes_payload = node_response.json()
+    nodes_raw = (
+        nodes_payload.get("nodes", {}) if isinstance(nodes_payload, dict) else {}
+    )
+
+    state_counts: Counter[str] = Counter()
+    per_node: dict[str, dict[str, Any]] = {}
+    index_names: set[str] = set()
+    primary_shards = 0
+    replica_shards = 0
+    started_shards = 0
+
+    for row in shard_rows:
+        index_name = str(row.get("index", ""))
+        if index_name:
+            index_names.add(index_name)
+        state = str(row.get("state", "UNKNOWN")).upper()
+        state_counts[state] += 1
+        if state == "STARTED":
+            started_shards += 1
+
+        prirep = str(row.get("prirep", "")).lower()
+        is_primary = prirep == "p"
+        if is_primary:
+            primary_shards += 1
+        elif prirep == "r":
+            replica_shards += 1
+
+        node = str(row.get("node") or "UNASSIGNED")
+        node_bucket = per_node.setdefault(
+            node,
+            {
+                "node": node,
+                "shards": 0,
+                "primary_shards": 0,
+                "docs": 0,
+                "store_bytes": 0,
+            },
+        )
+        node_bucket["shards"] += 1
+        if is_primary:
+            node_bucket["primary_shards"] += 1
+        docs = _coerce_int(row.get("docs"))
+        if docs is not None:
+            node_bucket["docs"] += docs
+        store_bytes = _coerce_int(row.get("store"))
+        if store_bytes is not None:
+            node_bucket["store_bytes"] += store_bytes
+
+    started_nodes = [name for name in per_node if name != "UNASSIGNED"]
+    primary_counts = [
+        int(per_node[name]["primary_shards"])
+        for name in started_nodes
+        if int(per_node[name]["primary_shards"]) > 0
+    ]
+    min_primaries = min(primary_counts) if primary_counts else 0
+    max_primaries = max(primary_counts) if primary_counts else 0
+    primary_skew = (
+        float(max_primaries) / float(min_primaries)
+        if min_primaries > 0 and max_primaries > 0
+        else 1.0
+    )
+
+    nodes: list[dict[str, Any]] = []
+    if isinstance(nodes_raw, dict):
+        for node_id, node in nodes_raw.items():
+            if not isinstance(node, dict):
+                continue
+            search = node.get("indices", {}).get("search", {})
+            thread_pool = node.get("thread_pool", {}).get("search", {})
+            query_total = _coerce_int(search.get("query_total")) or 0
+            query_time_ms = _coerce_int(search.get("query_time_in_millis")) or 0
+            fetch_total = _coerce_int(search.get("fetch_total")) or 0
+            fetch_time_ms = _coerce_int(search.get("fetch_time_in_millis")) or 0
+            queue = _coerce_int(thread_pool.get("queue")) or 0
+            rejected = _coerce_int(thread_pool.get("rejected")) or 0
+            nodes.append(
+                {
+                    "node_id": node_id,
+                    "node_name": node.get("name", node_id),
+                    "roles": node.get("roles", []),
+                    "query_total": query_total,
+                    "query_time_ms": query_time_ms,
+                    "avg_query_ms": round(query_time_ms / query_total, 3)
+                    if query_total > 0
+                    else 0.0,
+                    "fetch_total": fetch_total,
+                    "fetch_time_ms": fetch_time_ms,
+                    "avg_fetch_ms": round(fetch_time_ms / fetch_total, 3)
+                    if fetch_total > 0
+                    else 0.0,
+                    "search_queue": queue,
+                    "search_rejected": rejected,
+                }
+            )
+
+    nodes.sort(
+        key=lambda item: (item["search_queue"], item["search_rejected"]), reverse=True
+    )
+    node_alloc = sorted(
+        per_node.values(),
+        key=lambda item: (item["primary_shards"], item["shards"]),
+        reverse=True,
+    )
+
+    return {
+        "index": index,
+        "indices": sorted(index_names),
+        "shards": {
+            "total": len(shard_rows),
+            "started": started_shards,
+            "primaries": primary_shards,
+            "replicas": replica_shards,
+            "states": dict(state_counts),
+            "nodes_with_started_shards": len(started_nodes),
+            "primary_skew_ratio": round(primary_skew, 3),
+            "min_primaries_per_node": min_primaries,
+            "max_primaries_per_node": max_primaries,
+        },
+        "auto_workers": max(1, min(primary_shards, 8)),
+        "node_allocation": node_alloc,
+        "node_search_pressure": nodes,
+    }
+
+
+def collect_export_batch_plan(
+    client: ElasticsearchClient,
+    index: str,
+    *,
+    target_docs: int,
+    window: str,
+) -> dict[str, Any]:
+    """Collect age/tier breakdown and monthly batch suggestions."""
+    index_rows = client.cat_indices(
+        index,
+        sort="creation.date",
+        headers="index,docs.count,store.size,creation.date",
+    )
+    settings = client.get_index_settings(
+        index, "index.routing.allocation.include._tier_preference"
+    )
+    shard_response = client.get(
+        f"/_cat/shards/{index}",
+        params={"format": "json", "h": "index,prirep,state,node"},
+        timeout=60.0,
+    )
+    assert shard_response is not None
+    shard_rows_raw = shard_response.json()
+    shard_rows = (
+        [row for row in shard_rows_raw if isinstance(row, dict)]
+        if isinstance(shard_rows_raw, list)
+        else []
+    )
+
+    tier_votes_by_index: dict[str, Counter[str]] = {}
+    for row in shard_rows:
+        if str(row.get("prirep", "")).lower() != "p":
+            continue
+        if str(row.get("state", "")).upper() != "STARTED":
+            continue
+        idx_name = str(row.get("index", ""))
+        if not idx_name:
+            continue
+        tier_votes_by_index.setdefault(idx_name, Counter())[
+            _infer_tier_from_name(str(row.get("node", "")))
+        ] += 1
+
+    today = datetime.now(UTC).date()
+    entries: list[dict[str, Any]] = []
+    for idx in index_rows:
+        idx_name = idx.index or ""
+        if not idx_name:
+            continue
+        docs = _coerce_int(idx.docs_count) or 0
+        store_bytes = _parse_cat_store_bytes(idx.store_size)
+        created_ms = _coerce_int(idx.creation_date)
+        created_at = (
+            datetime.fromtimestamp(created_ms / 1000, tz=UTC)
+            if isinstance(created_ms, int)
+            else None
+        )
+        age_days = max((today - created_at.date()).days, 0) if created_at else None
+
+        settings_entry = (
+            settings.get(idx_name, {}) if isinstance(settings, dict) else {}
+        )
+        tier_pref = (
+            settings_entry.get("settings", {})
+            .get("index", {})
+            .get("routing", {})
+            .get("allocation", {})
+            .get("include", {})
+            .get("_tier_preference")
+        )
+        tier = "unknown"
+        votes = tier_votes_by_index.get(idx_name)
+        if votes:
+            tier = votes.most_common(1)[0][0]
+        elif isinstance(tier_pref, str):
+            tier = _infer_tier_from_preference(tier_pref)
+
+        entries.append(
+            {
+                "index": idx_name,
+                "docs": docs,
+                "store_bytes": store_bytes,
+                "created_ms": created_ms,
+                "created_at": created_at.isoformat() if created_at else None,
+                "age_days": age_days,
+                "age_bucket": _age_bucket(age_days),
+                "tier": tier,
+                "tier_preference": tier_pref if isinstance(tier_pref, str) else None,
+            }
+        )
+
+    tier_age: dict[str, dict[str, dict[str, int]]] = {}
+    for entry in entries:
+        tier = entry["tier"]
+        bucket = entry["age_bucket"]
+        agg = tier_age.setdefault(tier, {}).setdefault(
+            bucket,
+            {"indices": 0, "docs": 0, "store_bytes": 0},
+        )
+        agg["indices"] += 1
+        agg["docs"] += entry["docs"]
+        agg["store_bytes"] += entry["store_bytes"]
+
+    windows: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        created_ms = entry.get("created_ms")
+        if not isinstance(created_ms, int):
+            continue
+        created = datetime.fromtimestamp(created_ms / 1000, tz=UTC)
+        if window == "week":
+            start = _week_start(created)
+            end = _next_week_start(start)
+        else:
+            start = _month_start(created)
+            end = _next_month_start(start)
+        key = start.date().isoformat()
+        win = windows.setdefault(
+            key,
+            {
+                "from_date": start.date().isoformat(),
+                "to_date": end.date().isoformat(),
+                "indices": 0,
+                "docs": 0,
+                "store_bytes": 0,
+                "tier_mix": Counter(),
+            },
+        )
+        win["indices"] += 1
+        win["docs"] += entry["docs"]
+        win["store_bytes"] += entry["store_bytes"]
+        win["tier_mix"][entry["tier"]] += 1
+
+    monthly_windows: list[dict[str, Any]] = []
+    for key in sorted(windows.keys(), reverse=True):
+        win = windows[key]
+        mix = win.pop("tier_mix")
+        assert isinstance(mix, Counter)
+        win["dominant_tier"] = mix.most_common(1)[0][0] if mix else "unknown"
+        win["tier_mix"] = dict(mix.most_common())
+        monthly_windows.append(win)
+
+    # Pack consecutive oldest->newest month windows toward a target doc count.
+    suggested_batches: list[dict[str, Any]] = []
+    pending: dict[str, Any] | None = None
+    for win in reversed(monthly_windows):
+        if pending is None:
+            pending = {
+                "from_date": win["from_date"],
+                "to_date": win["to_date"],
+                "windows": 1,
+                "indices": win["indices"],
+                "docs": win["docs"],
+                "store_bytes": win["store_bytes"],
+                "tier_mix": Counter(win["tier_mix"]),
+            }
+        else:
+            pending["to_date"] = win["to_date"]
+            pending["windows"] += 1
+            pending["indices"] += win["indices"]
+            pending["docs"] += win["docs"]
+            pending["store_bytes"] += win["store_bytes"]
+            pending["tier_mix"].update(win["tier_mix"])
+        if pending["docs"] >= target_docs:
+            mix = pending["tier_mix"]
+            assert isinstance(mix, Counter)
+            suggested_batches.append(
+                {
+                    "from_date": pending["from_date"],
+                    "to_date": pending["to_date"],
+                    "windows": pending["windows"],
+                    "indices": pending["indices"],
+                    "docs": pending["docs"],
+                    "store_bytes": pending["store_bytes"],
+                    "dominant_tier": mix.most_common(1)[0][0] if mix else "unknown",
+                    "tier_mix": dict(mix.most_common()),
+                }
+            )
+            pending = None
+    if pending:
+        mix = pending["tier_mix"]
+        assert isinstance(mix, Counter)
+        suggested_batches.append(
+            {
+                "from_date": pending["from_date"],
+                "to_date": pending["to_date"],
+                "windows": pending["windows"],
+                "indices": pending["indices"],
+                "docs": pending["docs"],
+                "store_bytes": pending["store_bytes"],
+                "dominant_tier": mix.most_common(1)[0][0] if mix else "unknown",
+                "tier_mix": dict(mix.most_common()),
+            }
+        )
+
+    created_values = [
+        entry["created_ms"] for entry in entries if isinstance(entry["created_ms"], int)
+    ]
+    min_created = min(created_values) if created_values else None
+    max_created = max(created_values) if created_values else None
+    oldest = (
+        datetime.fromtimestamp(min_created / 1000, tz=UTC).isoformat()
+        if isinstance(min_created, int)
+        else None
+    )
+    newest = (
+        datetime.fromtimestamp(max_created / 1000, tz=UTC).isoformat()
+        if isinstance(max_created, int)
+        else None
+    )
+
+    return {
+        "index": index,
+        "target_docs_per_batch": target_docs,
+        "window": window,
+        "summary": {
+            "indices": len(entries),
+            "docs": sum(entry["docs"] for entry in entries),
+            "store_bytes": sum(entry["store_bytes"] for entry in entries),
+            "oldest_index_created_at": oldest,
+            "newest_index_created_at": newest,
+        },
+        "tier_age_breakdown": tier_age,
+        "windows": monthly_windows,
+        "monthly_windows": monthly_windows,
+        "suggested_batches": suggested_batches,
+    }
 
 
 def print_failed_shard_allocation_debug(
@@ -920,6 +1430,228 @@ def running(output_format: str) -> None:
         )
         if description:
             console.print(f"    {description}")
+
+
+@search.command(name="diagnose-export")
+@click.option(
+    "--index",
+    required=True,
+    help="Index or alias to analyze for export bottlenecks.",
+)
+@click.option(
+    "--top-n",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Number of node rows to show in text output.",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format (default: text).",
+)
+@click.option("--url", help="Source Elasticsearch URL (overrides stored credentials)")
+@click.option("--api-key-id", help="Source API key ID")
+@click.option("--api-key", help="Source API key value")
+@click.option("--username", help="Source username (basic auth)")
+@click.option("--password", help="Source password (basic auth)")
+def diagnose_export(
+    index: str,
+    top_n: int,
+    output_format: str,
+    url: str | None,
+    api_key_id: str | None,
+    api_key: str | None,
+    username: str | None,
+    password: str | None,
+) -> None:
+    """Inspect shard allocation and node search pressure for export tuning."""
+    if top_n <= 0:
+        console.print("[red]--top-n must be greater than 0.[/red]")
+        raise SystemExit(1)
+
+    client = create_client(
+        url=url,
+        api_key_id=api_key_id,
+        api_key=api_key,
+        username=username,
+        password=password,
+    )
+    payload = collect_export_diagnostics(client, index)
+
+    if output_format == "json":
+        console.print(json.dumps(payload, indent=2))
+        return
+
+    shards = payload["shards"]
+    state_parts = ", ".join(
+        f"{name}:{count}" for name, count in shards["states"].items()
+    )
+    console.print(f"[bold]Index/Alias:[/bold] {payload['index']}")
+    console.print(f"[bold]Resolved indices:[/bold] {len(payload['indices'])}")
+    console.print(
+        "[bold]Shard totals:[/bold] "
+        f"{shards['total']} total, {shards['primaries']} primaries, {shards['replicas']} replicas"
+    )
+    console.print(
+        "[bold]Shard states:[/bold] " + (state_parts if state_parts else "n/a")
+    )
+    console.print(
+        f"[bold]Nodes with started shards:[/bold] {shards['nodes_with_started_shards']}"
+    )
+    console.print(
+        "[bold]Primary skew:[/bold] "
+        f"{shards['primary_skew_ratio']:.2f}x "
+        f"(min={shards['min_primaries_per_node']}, max={shards['max_primaries_per_node']})"
+    )
+    console.print(
+        "[bold]Auto worker suggestion:[/bold] "
+        f"{payload['auto_workers']} (same cap used by export when --workers=0)"
+    )
+    console.print()
+    console.print("[bold]Top nodes by shard allocation[/bold]")
+    for row in payload["node_allocation"][:top_n]:
+        console.print(
+            f"  {row['node']}  primaries={row['primary_shards']} "
+            f"shards={row['shards']} docs={format_human_number(row['docs'])} "
+            f"store={_format_bytes(row['store_bytes'])}"
+        )
+    console.print()
+    console.print("[bold]Top nodes by search queue/rejections[/bold]")
+    for row in payload["node_search_pressure"][:top_n]:
+        console.print(
+            f"  {row['node_name']}  queue={row['search_queue']} "
+            f"rejected={row['search_rejected']} "
+            f"avg_query={row['avg_query_ms']}ms avg_fetch={row['avg_fetch_ms']}ms"
+        )
+
+
+@search.command(name="plan-export")
+@click.option(
+    "--index",
+    required=True,
+    help="Index or alias to analyze for time-windowed export planning.",
+)
+@click.option(
+    "--target-docs",
+    type=int,
+    default=200_000_000,
+    show_default=True,
+    help="Target documents per suggested batch window.",
+)
+@click.option(
+    "--window",
+    "window_granularity",
+    type=click.Choice(["month", "week"]),
+    default="month",
+    show_default=True,
+    help="Planning window granularity.",
+)
+@click.option(
+    "--top-n",
+    type=int,
+    default=12,
+    show_default=True,
+    help="Number of windows and batches shown in text output.",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format (default: text).",
+)
+@click.option("--url", help="Source Elasticsearch URL (overrides stored credentials)")
+@click.option("--api-key-id", help="Source API key ID")
+@click.option("--api-key", help="Source API key value")
+@click.option("--username", help="Source username (basic auth)")
+@click.option("--password", help="Source password (basic auth)")
+def plan_export(
+    index: str,
+    target_docs: int,
+    window_granularity: str,
+    top_n: int,
+    output_format: str,
+    url: str | None,
+    api_key_id: str | None,
+    api_key: str | None,
+    username: str | None,
+    password: str | None,
+) -> None:
+    """Plan export batches by index age, inferred tier, and time windows."""
+    if target_docs <= 0:
+        console.print("[red]--target-docs must be greater than 0.[/red]")
+        raise SystemExit(1)
+    if top_n <= 0:
+        console.print("[red]--top-n must be greater than 0.[/red]")
+        raise SystemExit(1)
+
+    client = create_client(
+        url=url,
+        api_key_id=api_key_id,
+        api_key=api_key,
+        username=username,
+        password=password,
+    )
+    payload = collect_export_batch_plan(
+        client,
+        index,
+        target_docs=target_docs,
+        window=window_granularity,
+    )
+
+    if output_format == "json":
+        console.print(json.dumps(payload, indent=2))
+        return
+
+    summary = payload["summary"]
+    console.print(f"[bold]Index/Alias:[/bold] {payload['index']}")
+    console.print(f"[bold]Indices:[/bold] {summary['indices']}")
+    console.print(
+        f"[bold]Estimated docs:[/bold] {format_human_number(summary['docs'])}"
+    )
+    console.print(
+        f"[bold]Estimated store:[/bold] {_format_bytes(summary['store_bytes'])}"
+    )
+    console.print(
+        "[bold]Index creation span:[/bold] "
+        f"{summary['oldest_index_created_at'] or '-'} -> {summary['newest_index_created_at'] or '-'}"
+    )
+    console.print(
+        f"[bold]Target docs per batch:[/bold] {format_human_number(payload['target_docs_per_batch'])}"
+    )
+    console.print()
+    console.print("[bold]Tier x age breakdown[/bold]")
+    for tier, buckets in sorted(payload["tier_age_breakdown"].items()):
+        for bucket, agg in sorted(buckets.items()):
+            console.print(
+                f"  tier={tier:<7} age={bucket:<8} indices={agg['indices']:<4} "
+                f"docs={format_human_number(agg['docs']):<14} "
+                f"store={_format_bytes(agg['store_bytes'])}"
+            )
+    console.print()
+    console.print(f"[bold]{window_granularity.title()} windows (newest first)[/bold]")
+    for row in payload["windows"][:top_n]:
+        console.print(
+            f"  {row['from_date']} -> {row['to_date']}  "
+            f"indices={row['indices']} docs={format_human_number(row['docs'])} "
+            f"tier={row['dominant_tier']}"
+        )
+    console.print()
+    console.print("[bold]Suggested batches (oldest -> newest)[/bold]")
+    for idx, row in enumerate(payload["suggested_batches"][:top_n], start=1):
+        console.print(
+            f"  batch {idx:02d}  {row['from_date']} -> {row['to_date']}  "
+            f"windows={row['windows']} indices={row['indices']} "
+            f"docs={format_human_number(row['docs'])} tier={row['dominant_tier']}"
+        )
+    console.print()
+    console.print(
+        "[yellow]Note:[/yellow] windows use index creation date as a proxy; "
+        "validate with your @timestamp distribution."
+    )
 
 
 @search.command(name="debug-shards")

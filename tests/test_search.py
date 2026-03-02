@@ -13,9 +13,10 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 from click.testing import CliRunner
-
 from conftest import ElasticsearchSecureService
+
 from elastic_utils.cli import cli
+from elastic_utils.formatting import format_compact_number
 from elastic_utils.search import adapt_page_size, infer_input_format
 
 
@@ -60,6 +61,8 @@ def test_search_help(runner: CliRunner) -> None:
     assert "running" in result.output
     assert "wait" in result.output
     assert "debug-shards" in result.output
+    assert "diagnose-export" in result.output
+    assert "plan-export" in result.output
     assert "get" in result.output
     assert "delete" in result.output
     assert "export" in result.output
@@ -90,6 +93,12 @@ def test_adapt_page_size_scales_down() -> None:
         max_page_size=5000,
     )
     assert new_size < 1000
+
+
+def test_format_compact_number_keeps_integer_magnitude() -> None:
+    """Compact formatter should not strip significant integer zeros."""
+    assert format_compact_number(2_000_000) == "2M"
+    assert format_compact_number(200_000_000) == "200M"
 
 
 def test_infer_input_format_from_extension(tmp_path: Path) -> None:
@@ -721,7 +730,7 @@ def test_search_running_success(runner: CliRunner, authenticated_creds: Path) ->
                         "id": 441,
                         "action": "indices:data/read/async_search",
                         "running_time_in_nanos": 12_340_000_000,
-                        "description": "indices[alias-complete], source[...]",
+                        "description": "indices[my-alias], source[...]",
                         "cancellable": True,
                     },
                     "node-a:442": {
@@ -758,6 +767,164 @@ def test_search_running_none(runner: CliRunner, authenticated_creds: Path) -> No
 
     assert result.exit_code == 0
     assert "No running async searches found" in result.output
+
+
+def test_search_diagnose_export_json(
+    runner: CliRunner, authenticated_creds: Path
+) -> None:
+    """Diagnose-export JSON output should summarize shard and node diagnostics."""
+    shard_response = MagicMock()
+    shard_response.json.return_value = [
+        {
+            "index": "logs-0001",
+            "shard": "0",
+            "prirep": "p",
+            "state": "STARTED",
+            "node": "node-a",
+            "docs": "1000",
+            "store": "2048",
+        },
+        {
+            "index": "logs-0001",
+            "shard": "0",
+            "prirep": "r",
+            "state": "STARTED",
+            "node": "node-b",
+            "docs": "1000",
+            "store": "2048",
+        },
+    ]
+    nodes_response = MagicMock()
+    nodes_response.json.return_value = {
+        "nodes": {
+            "node-a": {
+                "name": "data-hot-a",
+                "roles": ["data_hot"],
+                "indices": {
+                    "search": {
+                        "query_total": 10,
+                        "query_time_in_millis": 500,
+                        "fetch_total": 10,
+                        "fetch_time_in_millis": 100,
+                    }
+                },
+                "thread_pool": {"search": {"queue": 2, "rejected": 1}},
+            }
+        }
+    }
+
+    with patch(
+        "elastic_utils.client.httpx.request",
+        side_effect=[shard_response, nodes_response],
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "diagnose-export",
+                "--index",
+                "my-alias",
+                "--output",
+                "json",
+            ],
+        )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["index"] == "my-alias"
+    assert payload["shards"]["total"] == 2
+    assert payload["shards"]["primaries"] == 1
+    assert payload["auto_workers"] == 1
+    assert payload["node_search_pressure"][0]["search_queue"] == 2
+
+
+def test_search_plan_export_json(runner: CliRunner, authenticated_creds: Path) -> None:
+    """Plan-export JSON output should include tier/age and batch suggestions."""
+    indices_response = MagicMock()
+    indices_response.json.return_value = [
+        {
+            "index": "logs-2026.02.01",
+            "docs.count": "1000",
+            "store.size": "10mb",
+            "creation.date": "1738368000000",
+        },
+        {
+            "index": "logs-2026.01.01",
+            "docs.count": "2000",
+            "store.size": "20mb",
+            "creation.date": "1735689600000",
+        },
+    ]
+    settings_response = MagicMock()
+    settings_response.json.return_value = {
+        "logs-2026.02.01": {
+            "settings": {
+                "index": {
+                    "routing": {
+                        "allocation": {
+                            "include": {"_tier_preference": "data_hot,data_warm"}
+                        }
+                    }
+                }
+            }
+        },
+        "logs-2026.01.01": {
+            "settings": {
+                "index": {
+                    "routing": {
+                        "allocation": {
+                            "include": {"_tier_preference": "data_cold,data_warm"}
+                        }
+                    }
+                }
+            }
+        },
+    }
+    shards_response = MagicMock()
+    shards_response.json.return_value = [
+        {
+            "index": "logs-2026.02.01",
+            "prirep": "p",
+            "state": "STARTED",
+            "node": "elasticsearch-main-es-hot-0",
+        },
+        {
+            "index": "logs-2026.01.01",
+            "prirep": "p",
+            "state": "STARTED",
+            "node": "elasticsearch-main-es-cold-0",
+        },
+    ]
+
+    with patch(
+        "elastic_utils.client.httpx.request",
+        side_effect=[indices_response, settings_response, shards_response],
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "plan-export",
+                "--index",
+                "my-alias",
+                "--target-docs",
+                "2500",
+                "--window",
+                "week",
+                "--output",
+                "json",
+            ],
+        )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["index"] == "my-alias"
+    assert payload["window"] == "week"
+    assert payload["summary"]["indices"] == 2
+    assert payload["summary"]["docs"] == 3000
+    assert payload["windows"]
+    assert payload["monthly_windows"]
+    assert payload["suggested_batches"]
 
 
 def test_search_debug_shards_with_failures(
