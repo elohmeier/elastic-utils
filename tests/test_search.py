@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -128,6 +129,357 @@ def test_search_export_parquet_requires_output(
     )
     assert result.exit_code == 1
     assert "Parquet export requires --output" in result.output
+
+
+def _export_query_for_fingerprint(page_size: int) -> dict[str, Any]:
+    return {
+        "query": {"match_all": {}},
+        "sort": [{"@timestamp": "asc"}],
+        "size": page_size,
+    }
+
+
+def _query_fingerprint(query: dict[str, Any]) -> str:
+    payload = json.dumps(query, sort_keys=True, separators=(",", ":"))
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_resume_manifest(
+    output_file: Path,
+    *,
+    page_size: int,
+    workers: int,
+    query_fingerprint: str,
+    docs_written: int = 0,
+    pages_written: int = 0,
+    search_after: list[Any] | None = None,
+) -> Path:
+    state_dir = output_file.parent / f"{output_file.name}.elastic-utils-export-state"
+    parts_dir = state_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    workers_payload = {}
+    for worker_id in range(workers):
+        workers_payload[str(worker_id)] = {
+            "search_after": search_after if worker_id == 0 else None,
+            "next_page_size": page_size,
+            "docs_written": docs_written if worker_id == 0 else 0,
+            "pages_written": pages_written if worker_id == 0 else 0,
+            "done": False,
+        }
+    manifest = {
+        "version": 1,
+        "index": "source-index",
+        "output_file": output_file.name,
+        "output_format": "parquet",
+        "query_fingerprint": query_fingerprint,
+        "workers": workers_payload,
+        "resolved_workers": workers,
+        "compression": "zstd",
+        "row_group_size": 50000,
+        "docs_written": docs_written,
+        "pages_written": pages_written,
+        "next_part": 1,
+        "parts": [],
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    (state_dir / "manifest.json").write_text(json.dumps(manifest))
+    return state_dir
+
+
+def test_search_export_parquet_auto_resume_from_state(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Parquet export should auto-resume from existing state for matching command."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.parquet"
+    page_size = 2
+    query_fingerprint = _query_fingerprint(_export_query_for_fingerprint(page_size))
+    state_dir = _write_resume_manifest(
+        output_file,
+        page_size=page_size,
+        workers=1,
+        query_fingerprint=query_fingerprint,
+        docs_written=1,
+        pages_written=1,
+        search_after=[111],
+    )
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+    shards.failures = []
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 2
+    poll_result.response.hits.total = 2
+
+    observed_search_after: Any = None
+
+    def fake_search_with_pit_raw(
+        request: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        nonlocal observed_search_after
+        observed_search_after = request.get("search_after")
+        return {"hits": {"hits": []}}
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+    mock_client.open_pit.return_value = "pit-1"
+    mock_client.search_with_pit_raw.side_effect = fake_search_with_pit_raw
+
+    def fake_assemble(**kwargs: Any) -> None:
+        output = kwargs["output"]
+        output.write_text("ok")
+
+    with (
+        patch("elastic_utils.search.create_client", return_value=mock_client),
+        patch("elastic_utils.search.write_parquet_hits_file"),
+        patch(
+            "elastic_utils.search.assemble_parquet_from_parts",
+            side_effect=fake_assemble,
+        ),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--format",
+                "parquet",
+                "--workers",
+                "1",
+                "--no-adaptive-page-size",
+                "--page-size",
+                str(page_size),
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Resuming export from existing state" in result.output
+    assert observed_search_after == [111]
+    assert output_file.exists()
+    assert not state_dir.exists()
+
+
+def test_search_export_parquet_resume_state_query_mismatch_fails(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Parquet resume should fail when manifest doesn't match query fingerprint."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.parquet"
+    _write_resume_manifest(
+        output_file,
+        page_size=2,
+        workers=1,
+        query_fingerprint="different-fingerprint",
+    )
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+    shards.failures = []
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 0
+    poll_result.response.hits.total = 0
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--format",
+                "parquet",
+                "--workers",
+                "1",
+                "--no-adaptive-page-size",
+                "--page-size",
+                "2",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Resume state mismatch for query_fingerprint" in result.output
+
+
+def test_search_export_parquet_no_resume_with_existing_state_fails(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Parquet export with --no-resume should fail if state exists."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.parquet"
+    query_fingerprint = _query_fingerprint(_export_query_for_fingerprint(2))
+    _write_resume_manifest(
+        output_file,
+        page_size=2,
+        workers=1,
+        query_fingerprint=query_fingerprint,
+    )
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+    shards.failures = []
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 0
+    poll_result.response.hits.total = 0
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--format",
+                "parquet",
+                "--workers",
+                "1",
+                "--no-adaptive-page-size",
+                "--page-size",
+                "2",
+                "--no-resume",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Resume state already exists" in result.output
+
+
+def test_search_export_parquet_restart_discards_existing_state(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Parquet export with --restart should ignore stale resume state."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.parquet"
+    state_dir = _write_resume_manifest(
+        output_file,
+        page_size=2,
+        workers=1,
+        query_fingerprint="stale-fingerprint",
+    )
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+    shards.failures = []
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 1
+    poll_result.response.hits.total = 1
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+    mock_client.open_pit.return_value = "pit-1"
+    mock_client.search_with_pit_raw.side_effect = [
+        {
+            "hits": {
+                "hits": [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
+            },
+            "pit_id": "pit-2",
+        },
+        {"hits": {"hits": []}},
+    ]
+
+    def fake_assemble(**kwargs: Any) -> None:
+        output = kwargs["output"]
+        output.write_text("ok")
+
+    with (
+        patch("elastic_utils.search.create_client", return_value=mock_client),
+        patch(
+            "elastic_utils.search.assemble_parquet_from_parts",
+            side_effect=fake_assemble,
+        ),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--format",
+                "parquet",
+                "--workers",
+                "1",
+                "--no-adaptive-page-size",
+                "--page-size",
+                "2",
+                "--restart",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Export complete" in result.output
+    assert output_file.exists()
+    assert not state_dir.exists()
 
 
 def test_search_submit_no_query(runner: CliRunner, authenticated_creds: Path) -> None:
@@ -2068,3 +2420,147 @@ def test_search_export_interrupt_shutdown_integration(
     assert process.returncode != 0
     assert "Exception ignored on threading shutdown" not in output
     assert "Interrupt received, stopping workers" in output or "Aborted." in output
+
+
+def test_search_export_parquet_resume_after_interrupt_integration(
+    elasticsearch_secure_service: ElasticsearchSecureService,
+    tmp_path: Path,
+) -> None:
+    """Interrupted parquet export should leave resumable state and finish on rerun."""
+    pytest.importorskip("pyarrow.parquet")
+    import httpx as real_httpx
+    import pyarrow.parquet as pq
+
+    url = (
+        f"{elasticsearch_secure_service.scheme}://"
+        f"{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
+    )
+    index_name = "interrupt-export-parquet-index"
+
+    try:
+        real_httpx.delete(
+            f"{url}/{index_name}",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            timeout=30.0,
+        )
+    except Exception:
+        pass
+
+    real_httpx.put(
+        f"{url}/{index_name}",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        json={
+            "mappings": {
+                "properties": {
+                    "message": {"type": "text"},
+                    "@timestamp": {"type": "date"},
+                }
+            }
+        },
+        timeout=30.0,
+    )
+    doc_count = 1200
+    for i in range(doc_count):
+        real_httpx.post(
+            f"{url}/{index_name}/_doc",
+            auth=(
+                elasticsearch_secure_service.user,
+                elasticsearch_secure_service.password,
+            ),
+            json={
+                "message": f"interrupt parquet document {i}",
+                "@timestamp": f"2026-01-19T12:{i // 60:02d}:{i % 60:02d}Z",
+            },
+            timeout=30.0,
+        )
+    real_httpx.post(
+        f"{url}/{index_name}/_refresh",
+        auth=(elasticsearch_secure_service.user, elasticsearch_secure_service.password),
+        timeout=30.0,
+    )
+
+    query_file = tmp_path / "interrupt-parquet-query.json"
+    query_file.write_text('{"query": {"match_all": {}}}')
+    output_file = tmp_path / "interrupt-export.parquet"
+    state_dir = tmp_path / f"{output_file.name}.elastic-utils-export-state"
+
+    cli_bin = Path(sys.executable).with_name("elastic-utils")
+    base_command = [
+        str(cli_bin),
+        "search",
+        "export",
+        "--index",
+        index_name,
+        "--query-file",
+        str(query_file),
+        "--output",
+        str(output_file),
+        "--format",
+        "parquet",
+        "--workers",
+        "1",
+        "--no-adaptive-page-size",
+        "--page-size",
+        "1",
+        "--url",
+        url,
+        "--username",
+        elasticsearch_secure_service.user,
+        "--password",
+        elasticsearch_secure_service.password,
+    ]
+
+    process = subprocess.Popen(  # noqa: S603
+        base_command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output_parts: list[str] = []
+    start = time.monotonic()
+    while time.monotonic() - start < 120:
+        if process.stdout is None:
+            break
+        line = process.stdout.readline()
+        if line:
+            output_parts.append(line)
+            if "Fetching with" in line:
+                time.sleep(1)
+                break
+            continue
+        if process.poll() is not None:
+            break
+
+    if process.poll() is None:
+        process.send_signal(signal.SIGINT)
+
+    try:
+        remaining, _ = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        remaining, _ = process.communicate(timeout=5)
+
+    output = "".join(output_parts) + (remaining or "")
+    assert process.returncode != 0
+    assert "Interrupt received, stopping workers" in output or "Aborted." in output
+    assert state_dir.exists()
+
+    resume_process = subprocess.run(  # noqa: S603
+        base_command,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    combined_output = (resume_process.stdout or "") + (resume_process.stderr or "")
+    assert resume_process.returncode == 0
+    assert "Resuming export from existing state" in combined_output
+    assert output_file.exists()
+    assert not state_dir.exists()
+
+    parquet_file = pq.ParquetFile(str(output_file))
+    assert parquet_file.metadata is not None
+    assert parquet_file.metadata.num_rows == doc_count

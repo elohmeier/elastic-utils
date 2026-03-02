@@ -121,6 +121,20 @@ elastic-utils search export --index alias-frozen --query-file query.json \
 elastic-utils search export --index alias-frozen --query-file query.json \
   --format parquet --parquet-compression zstd -o results.parquet
 
+# Resumable parquet export (default): if interrupted, rerun same command
+# to continue from local state in:
+#   results.parquet.elastic-utils-export-state/
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --format parquet -o results.parquet
+
+# Disable resume auto-detection (fails if state exists)
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --format parquet -o results.parquet --no-resume
+
+# Force a clean restart by discarding existing state
+elastic-utils search export --index alias-frozen --query-file query.json \
+  --format parquet -o results.parquet --restart
+
 # Export with explicit source credentials (instead of stored auth)
 elastic-utils search export --index alias-frozen --query-file query.json \
   --url http://source-es:9200 --username elastic --password secret \

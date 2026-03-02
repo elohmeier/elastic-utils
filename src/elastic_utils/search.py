@@ -1,12 +1,16 @@
 """Search commands for Elasticsearch async search and export."""
 
 import json
+import os
+import shutil
 import sys
 import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any
@@ -405,10 +409,21 @@ def should_cancel_async_search_on_interrupt() -> bool:
 class ExportChunk:
     """Batch of hits produced by a slice worker."""
 
+    worker_id: int
     hits: list[dict[str, Any]]
+    last_sort: Any
+    next_page_size: int
     page_size: int
     page_duration: float
     payload_bytes: int
+
+
+@dataclass
+class ExportWorkerDone:
+    """Signal that a worker has finished producing chunks."""
+
+    worker_id: int
+    success: bool
 
 
 def adapt_page_size(
@@ -464,74 +479,322 @@ class JsonlSink(HitSink):
             self._file.close()
 
 
-class ParquetSink(HitSink):
-    """Writes hits to a parquet stream with buffered row groups."""
+def _now_utc_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
-    def __init__(self, output: Path, compression: str, row_group_size: int) -> None:
+
+def _query_fingerprint(query: dict[str, Any]) -> str:
+    payload = json.dumps(query, sort_keys=True, separators=(",", ":"))
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f"{path.name}.tmp"
+    with tmp_path.open("w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _load_pyarrow() -> tuple[Any, Any]:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        console.print(
+            "[red]Parquet support requires pyarrow. Install with:[/red] "
+            "[bold]uv sync[/bold]"
+        )
+        raise SystemExit(1)
+    return pa, pq
+
+
+def _parquet_hit_schema(pa: Any) -> Any:
+    return pa.schema(
+        [
+            pa.field("hit_json", pa.large_string()),
+            pa.field("_id", pa.string()),
+            pa.field("_index", pa.string()),
+        ]
+    )
+
+
+def _hits_to_parquet_table(pa: Any, hits: list[dict[str, Any]]) -> Any:
+    schema = _parquet_hit_schema(pa)
+    rows = [
+        {
+            "hit_json": json.dumps(hit, separators=(",", ":")),
+            "_id": hit.get("_id"),
+            "_index": hit.get("_index"),
+        }
+        for hit in hits
+    ]
+    return pa.table(
+        {
+            "hit_json": pa.array(
+                [row["hit_json"] for row in rows], type=pa.large_string()
+            ),
+            "_id": pa.array([row["_id"] for row in rows], type=pa.string()),
+            "_index": pa.array([row["_index"] for row in rows], type=pa.string()),
+        },
+        schema=schema,
+    )
+
+
+def write_parquet_hits_file(
+    *,
+    output: Path,
+    hits: list[dict[str, Any]],
+    compression: str,
+    row_group_size: int,
+) -> None:
+    pa, pq = _load_pyarrow()
+    codec = None if compression == "none" else compression
+    table = _hits_to_parquet_table(pa, hits)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.parent / f"{output.name}.tmp"
+    pq.write_table(
+        table,
+        str(tmp_output),
+        compression=codec,
+        row_group_size=row_group_size,
+    )
+    os.replace(tmp_output, output)
+
+
+def assemble_parquet_from_parts(
+    *,
+    output: Path,
+    part_paths: list[Path],
+    compression: str,
+    row_group_size: int,
+) -> None:
+    pa, pq = _load_pyarrow()
+    codec = None if compression == "none" else compression
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.parent / f"{output.name}.tmp"
+    writer = pq.ParquetWriter(
+        str(tmp_output),
+        _parquet_hit_schema(pa),
+        compression=codec,
+    )
+    try:
+        for part_path in part_paths:
+            parquet_file = pq.ParquetFile(str(part_path))
+            for batch in parquet_file.iter_batches(batch_size=row_group_size):
+                writer.write_batch(batch)
+    finally:
+        writer.close()
+    os.replace(tmp_output, output)
+
+
+class ParquetExportState:
+    """Checkpoint and staged part-file manager for resumable parquet exports."""
+
+    VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        output: Path,
+        index: str,
+        query: dict[str, Any],
+        workers: int,
+        compression: str,
+        row_group_size: int,
+    ) -> None:
+        self.output = output
+        self.state_dir = output.parent / f"{output.name}.elastic-utils-export-state"
+        self.parts_dir = self.state_dir / "parts"
+        self.manifest_path = self.state_dir / "manifest.json"
+        self.index = index
+        self.query_fingerprint = _query_fingerprint(query)
+        self.workers = workers
+        self.compression = compression
+        self.row_group_size = row_group_size
+        self._manifest: dict[str, Any] | None = None
+
+    def start(self, *, resume: bool, restart: bool) -> bool:
+        if restart and self.state_dir.exists():
+            shutil.rmtree(self.state_dir)
+
+        if self.manifest_path.exists():
+            if not resume:
+                console.print(
+                    "[red]Resume state already exists for this output.[/red] "
+                    "Use [bold]--resume[/bold] or [bold]--restart[/bold]."
+                )
+                raise SystemExit(1)
+            self._manifest = self._load_manifest()
+            self._validate_manifest()
+            return True
+
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.parts_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest = self._new_manifest()
+        self._save_manifest()
+        return False
+
+    def _new_manifest(self) -> dict[str, Any]:
+        workers = {
+            str(worker_id): {
+                "search_after": None,
+                "next_page_size": None,
+                "docs_written": 0,
+                "pages_written": 0,
+                "done": False,
+            }
+            for worker_id in range(self.workers)
+        }
+        now = _now_utc_iso()
+        return {
+            "version": self.VERSION,
+            "index": self.index,
+            "output_file": self.output.name,
+            "output_format": "parquet",
+            "query_fingerprint": self.query_fingerprint,
+            "workers": workers,
+            "resolved_workers": self.workers,
+            "compression": self.compression,
+            "row_group_size": self.row_group_size,
+            "docs_written": 0,
+            "pages_written": 0,
+            "next_part": 1,
+            "parts": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _load_manifest(self) -> dict[str, Any]:
         try:
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-        except ImportError:
+            return json.loads(self.manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
             console.print(
-                "[red]Parquet support requires pyarrow. Install with:[/red] "
-                "[bold]uv sync[/bold]"
+                "[red]Unable to read existing resume manifest.[/red] "
+                "Use [bold]--restart[/bold] to reset state."
             )
             raise SystemExit(1)
 
-        codec = None if compression == "none" else compression
-        self._pa = pa
-        self._schema = pa.schema(
-            [
-                pa.field("hit_json", pa.large_string()),
-                pa.field("_id", pa.string()),
-                pa.field("_index", pa.string()),
-            ]
-        )
-        self._writer = pq.ParquetWriter(
-            str(output),
-            self._schema,
-            compression=codec,
-        )
-        self._row_group_size = row_group_size
-        self._rows: list[dict[str, str | None]] = []
-
-    def _flush_rows(self) -> None:
-        if not self._rows:
-            return
-
-        table = self._pa.table(
-            {
-                "hit_json": self._pa.array(
-                    [row["hit_json"] for row in self._rows],
-                    type=self._pa.large_string(),
-                ),
-                "_id": self._pa.array(
-                    [row["_id"] for row in self._rows], type=self._pa.string()
-                ),
-                "_index": self._pa.array(
-                    [row["_index"] for row in self._rows], type=self._pa.string()
-                ),
-            },
-            schema=self._schema,
-        )
-        self._writer.write_table(table)
-        self._rows.clear()
-
-    def write_hits(self, hits: list[dict[str, Any]]) -> None:
-        for hit in hits:
-            self._rows.append(
-                {
-                    "hit_json": json.dumps(hit, separators=(",", ":")),
-                    "_id": hit.get("_id"),
-                    "_index": hit.get("_index"),
-                }
+    def _validate_manifest(self) -> None:
+        manifest = self.manifest
+        if manifest.get("version") != self.VERSION:
+            console.print(
+                "[red]Resume manifest version mismatch.[/red] "
+                "Use [bold]--restart[/bold] to reset state."
             )
-            if len(self._rows) >= self._row_group_size:
-                self._flush_rows()
+            raise SystemExit(1)
+        checks: list[tuple[str, Any]] = [
+            ("index", self.index),
+            ("output_format", "parquet"),
+            ("query_fingerprint", self.query_fingerprint),
+            ("resolved_workers", self.workers),
+            ("compression", self.compression),
+            ("row_group_size", self.row_group_size),
+        ]
+        for key, expected in checks:
+            if manifest.get(key) != expected:
+                console.print(
+                    f"[red]Resume state mismatch for {key}.[/red] "
+                    "Use [bold]--restart[/bold] to start over."
+                )
+                raise SystemExit(1)
 
-    def close(self) -> None:
-        self._flush_rows()
-        self._writer.close()
+    @property
+    def manifest(self) -> dict[str, Any]:
+        if self._manifest is None:
+            raise RuntimeError("Manifest not initialized")
+        return self._manifest
+
+    @property
+    def docs_written(self) -> int:
+        return int(self.manifest.get("docs_written", 0))
+
+    @property
+    def pages_written(self) -> int:
+        return int(self.manifest.get("pages_written", 0))
+
+    def worker_state(self, worker_id: int) -> dict[str, Any]:
+        workers = self.manifest.get("workers", {})
+        if not isinstance(workers, dict):
+            raise RuntimeError("Invalid resume manifest")
+        worker = workers.get(str(worker_id))
+        if not isinstance(worker, dict):
+            raise RuntimeError(f"Missing worker state for worker {worker_id}")
+        return worker
+
+    def record_chunk(self, chunk: ExportChunk) -> None:
+        manifest = self.manifest
+        part_num = int(manifest.get("next_part", 1))
+        part_name = f"part-{part_num:08d}.parquet"
+        part_path = self.parts_dir / part_name
+        write_parquet_hits_file(
+            output=part_path,
+            hits=chunk.hits,
+            compression=self.compression,
+            row_group_size=self.row_group_size,
+        )
+
+        parts = manifest.get("parts")
+        if not isinstance(parts, list):
+            raise RuntimeError("Invalid resume manifest parts")
+        parts.append(
+            {
+                "path": f"parts/{part_name}",
+                "rows": len(chunk.hits),
+                "worker_id": chunk.worker_id,
+            }
+        )
+        manifest["next_part"] = part_num + 1
+        manifest["docs_written"] = int(manifest.get("docs_written", 0)) + len(
+            chunk.hits
+        )
+        manifest["pages_written"] = int(manifest.get("pages_written", 0)) + 1
+
+        worker = self.worker_state(chunk.worker_id)
+        worker["search_after"] = chunk.last_sort
+        worker["next_page_size"] = chunk.next_page_size
+        worker["docs_written"] = int(worker.get("docs_written", 0)) + len(chunk.hits)
+        worker["pages_written"] = int(worker.get("pages_written", 0)) + 1
+        worker["done"] = False
+        self._save_manifest()
+
+    def mark_worker_done(self, worker_id: int) -> None:
+        worker = self.worker_state(worker_id)
+        worker["done"] = True
+        self._save_manifest()
+
+    def finalize_output(self) -> None:
+        parts_raw = self.manifest.get("parts", [])
+        if not isinstance(parts_raw, list):
+            raise RuntimeError("Invalid resume manifest parts")
+        part_paths: list[Path] = []
+        for part in parts_raw:
+            if not isinstance(part, dict):
+                continue
+            rel_path = part.get("path")
+            if not isinstance(rel_path, str):
+                continue
+            part_paths.append(self.state_dir / rel_path)
+        assemble_parquet_from_parts(
+            output=self.output,
+            part_paths=part_paths,
+            compression=self.compression,
+            row_group_size=self.row_group_size,
+        )
+
+    def cleanup(self) -> None:
+        if self.state_dir.exists():
+            shutil.rmtree(self.state_dir)
+
+    def _save_manifest(self) -> None:
+        manifest = self.manifest
+        manifest["updated_at"] = _now_utc_iso()
+        _atomic_write_text(
+            self.manifest_path,
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+        )
 
 
 def infer_input_format(input_file: Path, input_format: str | None) -> str:
@@ -1005,6 +1268,17 @@ def delete(search_id: str) -> None:
     help="Rows per parquet row group (default: 50000)",
 )
 @click.option(
+    "--resume/--no-resume",
+    default=True,
+    help="Resume interrupted parquet exports from local state (default: enabled)",
+)
+@click.option(
+    "--restart",
+    is_flag=True,
+    default=False,
+    help="Discard existing parquet resume state and start over",
+)
+@click.option(
     "--keep-alive",
     default="10m",
     help="PIT keep-alive duration (default: 10m)",
@@ -1053,6 +1327,8 @@ def export(
     max_page_size: int,
     parquet_compression: str,
     parquet_row_group_size: int,
+    resume: bool,
+    restart: bool,
     keep_alive: str,
     request_timeout: float,
     max_timeout_retries: int,
@@ -1085,6 +1361,9 @@ def export(
         raise SystemExit(1)
     if output_format == "parquet" and not output:
         console.print("[red]Parquet export requires --output.[/red]")
+        raise SystemExit(1)
+    if restart and not resume:
+        console.print("[red]--restart cannot be combined with --no-resume.[/red]")
         raise SystemExit(1)
     if request_timeout <= 0:
         console.print("[red]--request-timeout must be greater than 0.[/red]")
@@ -1242,6 +1521,25 @@ def export(
             f"{' and adaptive page sizing' if adaptive_page_size else ''}..."
         )
 
+    parquet_state: ParquetExportState | None = None
+    resumed = False
+    if output_format == "parquet":
+        assert output is not None
+        parquet_state = ParquetExportState(
+            output=output,
+            index=index,
+            query=query,
+            workers=resolved_workers,
+            compression=parquet_compression,
+            row_group_size=parquet_row_group_size,
+        )
+        resumed = parquet_state.start(resume=resume, restart=restart)
+        if resumed:
+            console.print(
+                "Resuming export from existing state "
+                f"({parquet_state.pages_written} pages, {parquet_state.docs_written:,} docs)."
+            )
+
     if output_format == "json":
         all_hits: list[dict[str, Any]] = []
         sink: HitSink | None = None
@@ -1249,18 +1547,19 @@ def export(
         sink = JsonlSink(output)
         all_hits = []
     else:
-        assert output is not None
-        sink = ParquetSink(output, parquet_compression, parquet_row_group_size)
+        sink = None
         all_hits = []
 
     queue_max_size = max(2 * resolved_workers, 2)
-    chunks: Queue[ExportChunk | Exception | None] = Queue(maxsize=queue_max_size)
+    chunks: Queue[ExportChunk | ExportWorkerDone | Exception] = Queue(
+        maxsize=queue_max_size
+    )
     stop_event = threading.Event()
     worker_errors: list[str] = []
     lock = threading.Lock()
     aborted = False
 
-    def enqueue_chunk(item: ExportChunk | Exception | None) -> None:
+    def enqueue_chunk(item: ExportChunk | ExportWorkerDone | Exception) -> None:
         """Put items into the queue without blocking shutdown forever."""
         while not stop_event.is_set():
             try:
@@ -1282,16 +1581,32 @@ def export(
             password=password,
         )
         pit_id: str | None = None
+        failed = False
         try:
+            worker_resume_state = (
+                parquet_state.worker_state(worker_id) if parquet_state else None
+            )
+            if worker_resume_state and bool(worker_resume_state.get("done")):
+                return
+
             with local_client.session():
                 pit_id = local_client.open_pit(index, keep_alive=keep_alive)
-                if adaptive_page_size:
-                    local_page_size = max(
-                        min(page_size, max_page_size), min_page_size
-                    )
+                resumed_page_size = (
+                    worker_resume_state.get("next_page_size")
+                    if worker_resume_state
+                    else None
+                )
+                if isinstance(resumed_page_size, int) and resumed_page_size > 0:
+                    local_page_size = resumed_page_size
+                elif adaptive_page_size:
+                    local_page_size = max(min(page_size, max_page_size), min_page_size)
                 else:
                     local_page_size = page_size
-                search_after = None
+                search_after = (
+                    worker_resume_state.get("search_after")
+                    if worker_resume_state
+                    else None
+                )
                 while not stop_event.is_set():
                     pit_query = query.copy()
                     pit_query["size"] = local_page_size
@@ -1346,22 +1661,10 @@ def export(
                         break
 
                     payload_bytes = len(json.dumps(response, separators=(",", ":")))
-                    enqueue_chunk(
-                        ExportChunk(
-                            hits=hits,
-                            page_size=local_page_size,
-                            page_duration=page_duration,
-                            payload_bytes=payload_bytes,
-                        )
-                    )
-
-                    search_after = hits[-1].get("sort")
-                    next_pit_id = response.get("pit_id")
-                    if isinstance(next_pit_id, str) and next_pit_id:
-                        pit_id = next_pit_id
-
+                    last_sort = hits[-1].get("sort")
+                    next_page_size = local_page_size
                     if adaptive_page_size:
-                        local_page_size = adapt_page_size(
+                        next_page_size = adapt_page_size(
                             local_page_size,
                             page_duration,
                             payload_bytes,
@@ -1369,7 +1672,26 @@ def export(
                             min_page_size=min_page_size,
                             max_page_size=max_page_size,
                         )
+                    enqueue_chunk(
+                        ExportChunk(
+                            worker_id=worker_id,
+                            hits=hits,
+                            last_sort=last_sort,
+                            next_page_size=next_page_size,
+                            page_size=local_page_size,
+                            page_duration=page_duration,
+                            payload_bytes=payload_bytes,
+                        )
+                    )
+
+                    search_after = last_sort
+                    next_pit_id = response.get("pit_id")
+                    if isinstance(next_pit_id, str) and next_pit_id:
+                        pit_id = next_pit_id
+
+                    local_page_size = next_page_size
         except Exception as e:
+            failed = True
             enqueue_chunk(e)
             stop_event.set()
         finally:
@@ -1378,10 +1700,10 @@ def export(
                     local_client.close_pit(pit_id)
                 except Exception:
                     pass
-            enqueue_chunk(None)
+            enqueue_chunk(ExportWorkerDone(worker_id=worker_id, success=not failed))
 
-    docs_written = 0
-    pages = 0
+    docs_written = parquet_state.docs_written if parquet_state else 0
+    pages = parquet_state.pages_written if parquet_state else 0
     recent_page_size = page_size
 
     executor = ThreadPoolExecutor(max_workers=resolved_workers)
@@ -1402,7 +1724,9 @@ def export(
             console=console,
         ) as progress:
             task = progress.add_task(
-                "Starting...", total=total_docs if total_docs > 0 else None
+                "Starting...",
+                total=total_docs if total_docs > 0 else None,
+                completed=docs_written,
             )
             finished_workers = 0
             while finished_workers < resolved_workers:
@@ -1410,7 +1734,9 @@ def export(
                     chunk = chunks.get(timeout=0.2)
                 except Empty:
                     continue
-                if chunk is None:
+                if isinstance(chunk, ExportWorkerDone):
+                    if parquet_state and chunk.success:
+                        parquet_state.mark_worker_done(chunk.worker_id)
                     finished_workers += 1
                     continue
 
@@ -1421,7 +1747,9 @@ def export(
                     continue
 
                 pages += 1
-                if sink:
+                if parquet_state:
+                    parquet_state.record_chunk(chunk)
+                elif sink:
                     sink.write_hits(chunk.hits)
                 else:
                     all_hits.extend(chunk.hits)
@@ -1455,6 +1783,14 @@ def export(
     if worker_errors:
         console.print(f"[red]Export failed:[/red] {worker_errors[0]}")
         raise SystemExit(1)
+
+    if parquet_state:
+        try:
+            parquet_state.finalize_output()
+            parquet_state.cleanup()
+        except Exception as e:
+            console.print(f"[red]Export failed while finalizing parquet:[/red] {e}")
+            raise SystemExit(1) from e
 
     final_count = docs_written if docs_written > 0 else len(all_hits)
     console.print(
