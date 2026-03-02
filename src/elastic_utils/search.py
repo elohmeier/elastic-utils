@@ -6,7 +6,7 @@ import shutil
 import sys
 import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -416,6 +416,7 @@ class ExportChunk:
     page_size: int
     page_duration: float
     payload_bytes: int
+    timeout_retries: int
 
 
 @dataclass
@@ -1296,6 +1297,17 @@ def delete(search_id: str) -> None:
     help="Max retries per PIT page on read timeout (default: 5)",
 )
 @click.option(
+    "--worker-progress/--no-worker-progress",
+    default=False,
+    help="Show per-worker progress tasks (default: disabled)",
+)
+@click.option(
+    "--worker-progress-top-n",
+    default=5,
+    type=int,
+    help="Number of slowest workers to show when --worker-progress is enabled (default: 5)",
+)
+@click.option(
     "--fail-on-shard-failures/--allow-shard-failures",
     default=True,
     help=(
@@ -1332,6 +1344,8 @@ def export(
     keep_alive: str,
     request_timeout: float,
     max_timeout_retries: int,
+    worker_progress: bool,
+    worker_progress_top_n: int,
     fail_on_shard_failures: bool,
     from_date: str | None,
     to_date: str | None,
@@ -1370,6 +1384,9 @@ def export(
         raise SystemExit(1)
     if max_timeout_retries < 0:
         console.print("[red]--max-timeout-retries cannot be negative.[/red]")
+        raise SystemExit(1)
+    if worker_progress_top_n <= 0:
+        console.print("[red]--worker-progress-top-n must be greater than 0.[/red]")
         raise SystemExit(1)
 
     client = create_client(
@@ -1681,6 +1698,7 @@ def export(
                             page_size=local_page_size,
                             page_duration=page_duration,
                             payload_bytes=payload_bytes,
+                            timeout_retries=timeout_failures,
                         )
                     )
 
@@ -1705,6 +1723,29 @@ def export(
     docs_written = parquet_state.docs_written if parquet_state else 0
     pages = parquet_state.pages_written if parquet_state else 0
     recent_page_size = page_size
+    fetch_started_at = time.perf_counter()
+    recent_docs: deque[tuple[float, int]] = deque()
+    worker_docs: dict[int, int] = {}
+    for worker_id in range(resolved_workers):
+        worker_doc_count = 0
+        if parquet_state:
+            worker_state = parquet_state.worker_state(worker_id)
+            worker_doc_count = int(worker_state.get("docs_written", 0))
+        worker_docs[worker_id] = worker_doc_count
+    worker_started_at: dict[int, float] = {
+        worker_id: fetch_started_at for worker_id in range(resolved_workers)
+    }
+    worker_last_page_duration: dict[int, float] = {
+        worker_id: 0.0 for worker_id in range(resolved_workers)
+    }
+    worker_last_chunk_at: dict[int, float] = {
+        worker_id: fetch_started_at for worker_id in range(resolved_workers)
+    }
+    worker_retry_counts: dict[int, int] = {
+        worker_id: 0 for worker_id in range(resolved_workers)
+    }
+    worker_finished: set[int] = set()
+    total_timeout_retries = 0
 
     executor = ThreadPoolExecutor(max_workers=resolved_workers)
     futures = [
@@ -1728,6 +1769,14 @@ def export(
                 total=total_docs if total_docs > 0 else None,
                 completed=docs_written,
             )
+            worker_task_ids: dict[int, int] = {}
+            if worker_progress:
+                slots = min(worker_progress_top_n, resolved_workers)
+                for slot in range(slots):
+                    worker_task_ids[slot] = progress.add_task(
+                        f"Worker slot {slot + 1}: waiting for data...",
+                        total=None,
+                    )
             finished_workers = 0
             while finished_workers < resolved_workers:
                 try:
@@ -1737,6 +1786,7 @@ def export(
                 if isinstance(chunk, ExportWorkerDone):
                     if parquet_state and chunk.success:
                         parquet_state.mark_worker_done(chunk.worker_id)
+                    worker_finished.add(chunk.worker_id)
                     finished_workers += 1
                     continue
 
@@ -1756,14 +1806,86 @@ def export(
 
                 docs_written += len(chunk.hits)
                 recent_page_size = chunk.page_size
+                total_timeout_retries += chunk.timeout_retries
+                worker_docs[chunk.worker_id] += len(chunk.hits)
+                worker_last_page_duration[chunk.worker_id] = chunk.page_duration
+                worker_last_chunk_at[chunk.worker_id] = time.perf_counter()
+                worker_retry_counts[chunk.worker_id] += chunk.timeout_retries
+
+                now = time.perf_counter()
+                recent_docs.append((now, len(chunk.hits)))
+                while recent_docs and now - recent_docs[0][0] > 30.0:
+                    recent_docs.popleft()
+                elapsed = max(now - fetch_started_at, 1e-6)
+                docs_per_second = docs_written / elapsed
+
+                window_elapsed = now - recent_docs[0][0] if recent_docs else 0.0
+                window_docs = sum(doc_count for _, doc_count in recent_docs)
+                window_docs_per_second = (
+                    window_docs / window_elapsed
+                    if window_elapsed > 0
+                    else docs_per_second
+                )
+
+                worker_rates = [
+                    docs / max(now - worker_started_at[worker_id], 1e-6)
+                    for worker_id, docs in worker_docs.items()
+                    if docs > 0
+                ]
+                skew = (
+                    max(worker_rates) / min(worker_rates)
+                    if len(worker_rates) >= 2 and min(worker_rates) > 0
+                    else 1.0
+                )
                 progress.update(
                     task,
                     completed=docs_written,
                     description=(
                         f"Pages {pages} • {docs_written:,} docs"
                         f" • page_size~{recent_page_size}"
+                        f" • rate~{format_human_number(int(docs_per_second))}/s"
+                        f" (30s {format_human_number(int(window_docs_per_second))}/s)"
+                        f" • skew~{skew:.1f}x"
+                        f" • retries {total_timeout_retries}"
                     ),
                 )
+                if worker_progress and worker_task_ids:
+                    worker_rows: list[tuple[float, int, str]] = []
+                    for worker_id, docs in worker_docs.items():
+                        elapsed_worker = max(now - worker_started_at[worker_id], 1e-6)
+                        rate = docs / elapsed_worker
+                        idle_for = max(now - worker_last_chunk_at[worker_id], 0.0)
+                        state = (
+                            "done"
+                            if worker_id in worker_finished
+                            else ("active" if docs > 0 else "starting")
+                        )
+                        desc = (
+                            f"worker {worker_id:02d} • {state}"
+                            f" • {docs:,} docs"
+                            f" • {format_human_number(int(rate))}/s"
+                            f" • last {worker_last_page_duration[worker_id]:.2f}s"
+                            f" • idle {idle_for:.1f}s"
+                            f" • retries {worker_retry_counts[worker_id]}"
+                        )
+                        worker_rows.append((rate, worker_id, desc))
+
+                    slowest = sorted(worker_rows, key=lambda row: row[0])[
+                        : len(worker_task_ids)
+                    ]
+                    for slot, task_id in worker_task_ids.items():
+                        if slot < len(slowest):
+                            _, worker_id, worker_desc = slowest[slot]
+                            progress.update(
+                                task_id,
+                                completed=worker_docs[worker_id],
+                                description=worker_desc,
+                            )
+                        else:
+                            progress.update(
+                                task_id,
+                                description=f"Worker slot {slot + 1}: waiting for data...",
+                            )
 
         for future in futures:
             future.result()

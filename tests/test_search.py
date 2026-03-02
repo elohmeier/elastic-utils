@@ -131,6 +131,30 @@ def test_search_export_parquet_requires_output(
     assert "Parquet export requires --output" in result.output
 
 
+def test_search_export_rejects_non_positive_worker_progress_top_n(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Export should reject non-positive worker progress top-N values."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    result = runner.invoke(
+        cli,
+        [
+            "search",
+            "export",
+            "--index",
+            "source-index",
+            "--query-file",
+            str(query_file),
+            "--worker-progress",
+            "--worker-progress-top-n",
+            "0",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "--worker-progress-top-n must be greater than 0" in result.output
+
+
 def _export_query_for_fingerprint(page_size: int) -> dict[str, Any]:
     return {
         "query": {"match_all": {}},
