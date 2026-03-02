@@ -11,10 +11,10 @@ dependencies = [
   "click>=8.3.1",
   "httpx>=0.28.0",
   "platformdirs>=4.3.0",
-  "pyarrow>=23.0.1",
   "pydantic>=2.0",
   "rich>=14.2.0",
   "rich-click>=1.9.5",
+  "zstd>=1.5.7.3",
 ]
 
 [project.optional-dependencies]

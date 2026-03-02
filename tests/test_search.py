@@ -93,10 +93,10 @@ def test_adapt_page_size_scales_down() -> None:
 
 
 def test_infer_input_format_from_extension(tmp_path: Path) -> None:
-    """Import format should infer parquet from file extension."""
-    parquet_file = tmp_path / "input.parquet"
-    assert infer_input_format(parquet_file, None) == "parquet"
-    assert infer_input_format(parquet_file, "jsonl") == "jsonl"
+    """Import format should infer jsonl from extension."""
+    zst_file = tmp_path / "input.jsonl.zst"
+    assert infer_input_format(zst_file, None) == "jsonl"
+    assert infer_input_format(zst_file, "jsonl") == "jsonl"
 
 
 def test_search_submit_not_authenticated(
@@ -108,10 +108,8 @@ def test_search_submit_not_authenticated(
     assert "Not authenticated" in result.output
 
 
-def test_search_export_parquet_requires_output(
-    runner: CliRunner, tmp_path: Path
-) -> None:
-    """Parquet export should require file output."""
+def test_search_export_zstd_requires_output(runner: CliRunner, tmp_path: Path) -> None:
+    """Zstd export should require file output."""
     query_file = tmp_path / "query.json"
     query_file.write_text('{"query":{"match_all":{}}}')
     result = runner.invoke(
@@ -124,11 +122,11 @@ def test_search_export_parquet_requires_output(
             "--query-file",
             str(query_file),
             "--format",
-            "parquet",
+            "jsonl",
         ],
     )
     assert result.exit_code == 1
-    assert "Parquet export requires --output" in result.output
+    assert "Zstd export requires --output" in result.output
 
 
 def test_search_export_rejects_non_positive_worker_progress_top_n(
@@ -146,6 +144,8 @@ def test_search_export_rejects_non_positive_worker_progress_top_n(
             "source-index",
             "--query-file",
             str(query_file),
+            "--compression",
+            "none",
             "--worker-progress",
             "--worker-progress-top-n",
             "0",
@@ -194,12 +194,11 @@ def _write_resume_manifest(
         "version": 1,
         "index": "source-index",
         "output_file": output_file.name,
-        "output_format": "parquet",
+        "output_format": "jsonl",
         "query_fingerprint": query_fingerprint,
         "workers": workers_payload,
         "resolved_workers": workers,
         "compression": "zstd",
-        "row_group_size": 50000,
         "docs_written": docs_written,
         "pages_written": pages_written,
         "next_part": 1,
@@ -211,13 +210,13 @@ def _write_resume_manifest(
     return state_dir
 
 
-def test_search_export_parquet_auto_resume_from_state(
+def test_search_export_jsonl_zstd_auto_resume_from_state(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """Parquet export should auto-resume from existing state for matching command."""
+    """Compressed JSONL export should auto-resume from existing state."""
     query_file = tmp_path / "query.json"
     query_file.write_text('{"query":{"match_all":{}}}')
-    output_file = tmp_path / "output.parquet"
+    output_file = tmp_path / "output.jsonl.zst"
     page_size = 2
     query_fingerprint = _query_fingerprint(_export_query_for_fingerprint(page_size))
     state_dir = _write_resume_manifest(
@@ -267,9 +266,9 @@ def test_search_export_parquet_auto_resume_from_state(
 
     with (
         patch("elastic_utils.search.create_client", return_value=mock_client),
-        patch("elastic_utils.search.write_parquet_hits_file"),
+        patch("elastic_utils.search.write_jsonl_hits_file"),
         patch(
-            "elastic_utils.search.assemble_parquet_from_parts",
+            "elastic_utils.search.assemble_jsonl_from_parts",
             side_effect=fake_assemble,
         ),
     ):
@@ -285,7 +284,7 @@ def test_search_export_parquet_auto_resume_from_state(
                 "--output",
                 str(output_file),
                 "--format",
-                "parquet",
+                "jsonl",
                 "--workers",
                 "1",
                 "--no-adaptive-page-size",
@@ -301,13 +300,13 @@ def test_search_export_parquet_auto_resume_from_state(
     assert not state_dir.exists()
 
 
-def test_search_export_parquet_resume_state_query_mismatch_fails(
+def test_search_export_jsonl_zstd_resume_state_query_mismatch_fails(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """Parquet resume should fail when manifest doesn't match query fingerprint."""
+    """Resume should fail when manifest doesn't match query fingerprint."""
     query_file = tmp_path / "query.json"
     query_file.write_text('{"query":{"match_all":{}}}')
-    output_file = tmp_path / "output.parquet"
+    output_file = tmp_path / "output.jsonl.zst"
     _write_resume_manifest(
         output_file,
         page_size=2,
@@ -348,7 +347,7 @@ def test_search_export_parquet_resume_state_query_mismatch_fails(
                 "--output",
                 str(output_file),
                 "--format",
-                "parquet",
+                "jsonl",
                 "--workers",
                 "1",
                 "--no-adaptive-page-size",
@@ -361,13 +360,13 @@ def test_search_export_parquet_resume_state_query_mismatch_fails(
     assert "Resume state mismatch for query_fingerprint" in result.output
 
 
-def test_search_export_parquet_no_resume_with_existing_state_fails(
+def test_search_export_jsonl_zstd_no_resume_with_existing_state_fails(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """Parquet export with --no-resume should fail if state exists."""
+    """Export with --no-resume should fail if state exists."""
     query_file = tmp_path / "query.json"
     query_file.write_text('{"query":{"match_all":{}}}')
-    output_file = tmp_path / "output.parquet"
+    output_file = tmp_path / "output.jsonl.zst"
     query_fingerprint = _query_fingerprint(_export_query_for_fingerprint(2))
     _write_resume_manifest(
         output_file,
@@ -409,7 +408,7 @@ def test_search_export_parquet_no_resume_with_existing_state_fails(
                 "--output",
                 str(output_file),
                 "--format",
-                "parquet",
+                "jsonl",
                 "--workers",
                 "1",
                 "--no-adaptive-page-size",
@@ -423,13 +422,13 @@ def test_search_export_parquet_no_resume_with_existing_state_fails(
     assert "Resume state already exists" in result.output
 
 
-def test_search_export_parquet_restart_discards_existing_state(
+def test_search_export_jsonl_zstd_restart_discards_existing_state(
     runner: CliRunner, tmp_path: Path
 ) -> None:
-    """Parquet export with --restart should ignore stale resume state."""
+    """Export with --restart should ignore stale resume state."""
     query_file = tmp_path / "query.json"
     query_file.write_text('{"query":{"match_all":{}}}')
-    output_file = tmp_path / "output.parquet"
+    output_file = tmp_path / "output.jsonl.zst"
     state_dir = _write_resume_manifest(
         output_file,
         page_size=2,
@@ -474,7 +473,7 @@ def test_search_export_parquet_restart_discards_existing_state(
     with (
         patch("elastic_utils.search.create_client", return_value=mock_client),
         patch(
-            "elastic_utils.search.assemble_parquet_from_parts",
+            "elastic_utils.search.assemble_jsonl_from_parts",
             side_effect=fake_assemble,
         ),
     ):
@@ -490,7 +489,7 @@ def test_search_export_parquet_restart_discards_existing_state(
                 "--output",
                 str(output_file),
                 "--format",
-                "parquet",
+                "jsonl",
                 "--workers",
                 "1",
                 "--no-adaptive-page-size",
@@ -1580,6 +1579,8 @@ def test_search_export_fails_on_preflight_shard_failures_by_default(
                 "source-index",
                 "--query-file",
                 str(query_file),
+                "--compression",
+                "none",
             ],
         )
 
@@ -1683,6 +1684,8 @@ def test_search_export_interrupt_preflight_cancels_async_search(
                 "source-index",
                 "--query-file",
                 str(query_file),
+                "--compression",
+                "none",
             ],
         )
 
@@ -1721,6 +1724,8 @@ def test_search_export_interrupt_preflight_keeps_async_search_when_declined(
                 "source-index",
                 "--query-file",
                 str(query_file),
+                "--compression",
+                "none",
             ],
         )
 
@@ -1977,6 +1982,8 @@ def test_search_export_integration(
             str(query_file),
             "--output",
             str(output_file),
+            "--compression",
+            "none",
             "--page-size",
             "2",
         ],
@@ -2097,6 +2104,8 @@ def test_search_export_import_roundtrip_integration(
             str(query_file),
             "--output",
             str(output_file),
+            "--compression",
+            "none",
             "--page-size",
             "2",
         ],
@@ -2166,14 +2175,13 @@ def test_search_export_import_roundtrip_integration(
     assert "Conflicts skipped: 3" in reimport_result.output
 
 
-def test_search_export_import_parquet_roundtrip_integration(
+def test_search_export_import_zstd_roundtrip_integration(
     runner: CliRunner,
     mock_creds_path: Path,
     elasticsearch_secure_service: ElasticsearchSecureService,
     tmp_path: Path,
 ) -> None:
-    """Test parquet export/import roundtrip against real Elasticsearch."""
-    pytest.importorskip("pyarrow")
+    """Test compressed jsonl export/import roundtrip against real Elasticsearch."""
 
     url = f"{elasticsearch_secure_service.scheme}://{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
 
@@ -2194,8 +2202,8 @@ def test_search_export_import_parquet_roundtrip_integration(
 
     import httpx as real_httpx
 
-    source_index = "transfer-source-parquet-index"
-    dest_index = "transfer-dest-parquet-index"
+    source_index = "transfer-source-zstd-index"
+    dest_index = "transfer-dest-zstd-index"
 
     for index_name in [source_index, dest_index]:
         try:
@@ -2241,7 +2249,7 @@ def test_search_export_import_parquet_roundtrip_integration(
                 elasticsearch_secure_service.password,
             ),
             json={
-                "message": f"parquet roundtrip message {i}",
+                "message": f"zstd roundtrip message {i}",
                 "@timestamp": f"2026-01-19T12:00:0{i}Z",
             },
             timeout=30.0,
@@ -2258,9 +2266,9 @@ def test_search_export_import_parquet_roundtrip_integration(
         timeout=30.0,
     )
 
-    query_file = tmp_path / "parquet-roundtrip-query.json"
+    query_file = tmp_path / "zstd-roundtrip-query.json"
     query_file.write_text('{"query": {"match_all": {}}}')
-    output_file = tmp_path / "roundtrip-export.parquet"
+    output_file = tmp_path / "roundtrip-export.jsonl.zst"
 
     export_result = runner.invoke(
         cli,
@@ -2274,7 +2282,7 @@ def test_search_export_import_parquet_roundtrip_integration(
             "--output",
             str(output_file),
             "--format",
-            "parquet",
+            "jsonl",
             "--workers",
             "2",
             "--page-size",
@@ -2294,7 +2302,7 @@ def test_search_export_import_parquet_roundtrip_integration(
             "--input",
             str(output_file),
             "--input-format",
-            "parquet",
+            "jsonl",
             "--url",
             url,
             "--username",
@@ -2446,20 +2454,18 @@ def test_search_export_interrupt_shutdown_integration(
     assert "Interrupt received, stopping workers" in output or "Aborted." in output
 
 
-def test_search_export_parquet_resume_after_interrupt_integration(
+def test_search_export_jsonl_zstd_resume_after_interrupt_integration(
     elasticsearch_secure_service: ElasticsearchSecureService,
     tmp_path: Path,
 ) -> None:
-    """Interrupted parquet export should leave resumable state and finish on rerun."""
-    pytest.importorskip("pyarrow.parquet")
+    """Interrupted compressed jsonl export should leave resumable state and finish."""
     import httpx as real_httpx
-    import pyarrow.parquet as pq
 
     url = (
         f"{elasticsearch_secure_service.scheme}://"
         f"{elasticsearch_secure_service.host}:{elasticsearch_secure_service.port}"
     )
-    index_name = "interrupt-export-parquet-index"
+    index_name = "interrupt-export-zstd-index"
 
     try:
         real_httpx.delete(
@@ -2495,7 +2501,7 @@ def test_search_export_parquet_resume_after_interrupt_integration(
                 elasticsearch_secure_service.password,
             ),
             json={
-                "message": f"interrupt parquet document {i}",
+                "message": f"interrupt zstd document {i}",
                 "@timestamp": f"2026-01-19T12:{i // 60:02d}:{i % 60:02d}Z",
             },
             timeout=30.0,
@@ -2506,9 +2512,9 @@ def test_search_export_parquet_resume_after_interrupt_integration(
         timeout=30.0,
     )
 
-    query_file = tmp_path / "interrupt-parquet-query.json"
+    query_file = tmp_path / "interrupt-zstd-query.json"
     query_file.write_text('{"query": {"match_all": {}}}')
-    output_file = tmp_path / "interrupt-export.parquet"
+    output_file = tmp_path / "interrupt-export.jsonl.zst"
     state_dir = tmp_path / f"{output_file.name}.elastic-utils-export-state"
 
     cli_bin = Path(sys.executable).with_name("elastic-utils")
@@ -2523,7 +2529,7 @@ def test_search_export_parquet_resume_after_interrupt_integration(
         "--output",
         str(output_file),
         "--format",
-        "parquet",
+        "jsonl",
         "--workers",
         "1",
         "--no-adaptive-page-size",
@@ -2584,7 +2590,10 @@ def test_search_export_parquet_resume_after_interrupt_integration(
     assert "Resuming export from existing state" in combined_output
     assert output_file.exists()
     assert not state_dir.exists()
-
-    parquet_file = pq.ParquetFile(str(output_file))
-    assert parquet_file.metadata is not None
-    assert parquet_file.metadata.num_rows == doc_count
+    line_count = int(
+        subprocess.check_output(  # noqa: S603
+            ["zstd", "-q", "-d", "-c", str(output_file)],
+            text=True,
+        ).count("\n")
+    )
+    assert line_count == doc_count

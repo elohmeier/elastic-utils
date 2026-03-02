@@ -1,6 +1,7 @@
 """Search commands for Elasticsearch async search and export."""
 
 import json
+import importlib
 import os
 import shutil
 import sys
@@ -481,6 +482,25 @@ class JsonlSink(HitSink):
             self._file.close()
 
 
+def iter_jsonl_lines(input_file: Path, compression: str) -> Any:
+    """Yield JSONL lines, handling optional zstd compression."""
+    if compression == "none":
+        with input_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    yield line
+        return
+    payload = input_file.read_bytes()
+    zstd = _load_zstd_module()
+    try:
+        decompressed = zstd.decompress(payload)
+    except Exception as e:
+        raise RuntimeError(f"zstd decompression failed: {e}") from e
+    for line in decompressed.decode("utf-8").splitlines():
+        if line.strip():
+            yield line
+
+
 def _now_utc_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -500,100 +520,57 @@ def _atomic_write_text(path: Path, payload: str) -> None:
     os.replace(tmp_path, path)
 
 
-def _load_pyarrow() -> tuple[Any, Any]:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError:
-        console.print(
-            "[red]Parquet support requires pyarrow. Install with:[/red] "
-            "[bold]uv sync[/bold]"
-        )
-        raise SystemExit(1)
-    return pa, pq
-
-
-def _parquet_hit_schema(pa: Any) -> Any:
-    return pa.schema(
-        [
-            pa.field("hit_json", pa.large_string()),
-            pa.field("_id", pa.string()),
-            pa.field("_index", pa.string()),
-        ]
-    )
-
-
-def _hits_to_parquet_table(pa: Any, hits: list[dict[str, Any]]) -> Any:
-    schema = _parquet_hit_schema(pa)
-    rows = [
-        {
-            "hit_json": json.dumps(hit, separators=(",", ":")),
-            "_id": hit.get("_id"),
-            "_index": hit.get("_index"),
-        }
-        for hit in hits
-    ]
-    return pa.table(
-        {
-            "hit_json": pa.array(
-                [row["hit_json"] for row in rows], type=pa.large_string()
-            ),
-            "_id": pa.array([row["_id"] for row in rows], type=pa.string()),
-            "_index": pa.array([row["_index"] for row in rows], type=pa.string()),
-        },
-        schema=schema,
-    )
-
-
-def write_parquet_hits_file(
+def write_jsonl_hits_file(
     *,
     output: Path,
     hits: list[dict[str, Any]],
     compression: str,
-    row_group_size: int,
 ) -> None:
-    pa, pq = _load_pyarrow()
-    codec = None if compression == "none" else compression
-    table = _hits_to_parquet_table(pa, hits)
+    payload = "".join(f"{json.dumps(hit)}\n" for hit in hits).encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output.parent / f"{output.name}.tmp"
-    pq.write_table(
-        table,
-        str(tmp_output),
-        compression=codec,
-        row_group_size=row_group_size,
-    )
+    if compression == "none":
+        tmp_output.write_bytes(payload)
+        os.replace(tmp_output, output)
+        return
+    if compression != "zstd":
+        raise RuntimeError(f"Unsupported compression codec: {compression}")
+    zstd = _load_zstd_module()
+    try:
+        compressed = zstd.compress(payload, 3)
+    except Exception as e:
+        raise RuntimeError(f"zstd compression failed: {e}") from e
+    tmp_output.write_bytes(compressed)
     os.replace(tmp_output, output)
 
 
-def assemble_parquet_from_parts(
+def _load_zstd_module() -> Any:
+    try:
+        return importlib.import_module("zstd")
+    except ImportError:
+        console.print(
+            "[red]Zstd compression requires python-zstd.[/red] "
+            "Install dependencies with [bold]uv sync[/bold]."
+        )
+        raise SystemExit(1)
+
+
+def assemble_jsonl_from_parts(
     *,
     output: Path,
     part_paths: list[Path],
-    compression: str,
-    row_group_size: int,
 ) -> None:
-    pa, pq = _load_pyarrow()
-    codec = None if compression == "none" else compression
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output.parent / f"{output.name}.tmp"
-    writer = pq.ParquetWriter(
-        str(tmp_output),
-        _parquet_hit_schema(pa),
-        compression=codec,
-    )
-    try:
+    with tmp_output.open("wb") as out_file:
         for part_path in part_paths:
-            parquet_file = pq.ParquetFile(str(part_path))
-            for batch in parquet_file.iter_batches(batch_size=row_group_size):
-                writer.write_batch(batch)
-    finally:
-        writer.close()
+            with part_path.open("rb") as in_file:
+                shutil.copyfileobj(in_file, out_file)
     os.replace(tmp_output, output)
 
 
-class ParquetExportState:
-    """Checkpoint and staged part-file manager for resumable parquet exports."""
+class JsonlExportState:
+    """Checkpoint and staged part-file manager for resumable JSONL exports."""
 
     VERSION = 1
 
@@ -605,7 +582,6 @@ class ParquetExportState:
         query: dict[str, Any],
         workers: int,
         compression: str,
-        row_group_size: int,
     ) -> None:
         self.output = output
         self.state_dir = output.parent / f"{output.name}.elastic-utils-export-state"
@@ -615,7 +591,6 @@ class ParquetExportState:
         self.query_fingerprint = _query_fingerprint(query)
         self.workers = workers
         self.compression = compression
-        self.row_group_size = row_group_size
         self._manifest: dict[str, Any] | None = None
 
     def start(self, *, resume: bool, restart: bool) -> bool:
@@ -655,12 +630,11 @@ class ParquetExportState:
             "version": self.VERSION,
             "index": self.index,
             "output_file": self.output.name,
-            "output_format": "parquet",
+            "output_format": "jsonl",
             "query_fingerprint": self.query_fingerprint,
             "workers": workers,
             "resolved_workers": self.workers,
             "compression": self.compression,
-            "row_group_size": self.row_group_size,
             "docs_written": 0,
             "pages_written": 0,
             "next_part": 1,
@@ -689,11 +663,10 @@ class ParquetExportState:
             raise SystemExit(1)
         checks: list[tuple[str, Any]] = [
             ("index", self.index),
-            ("output_format", "parquet"),
+            ("output_format", "jsonl"),
             ("query_fingerprint", self.query_fingerprint),
             ("resolved_workers", self.workers),
             ("compression", self.compression),
-            ("row_group_size", self.row_group_size),
         ]
         for key, expected in checks:
             if manifest.get(key) != expected:
@@ -729,13 +702,13 @@ class ParquetExportState:
     def record_chunk(self, chunk: ExportChunk) -> None:
         manifest = self.manifest
         part_num = int(manifest.get("next_part", 1))
-        part_name = f"part-{part_num:08d}.parquet"
+        suffix = ".jsonl" if self.compression == "none" else ".jsonl.zst"
+        part_name = f"part-{part_num:08d}{suffix}"
         part_path = self.parts_dir / part_name
-        write_parquet_hits_file(
+        write_jsonl_hits_file(
             output=part_path,
             hits=chunk.hits,
             compression=self.compression,
-            row_group_size=self.row_group_size,
         )
 
         parts = manifest.get("parts")
@@ -779,11 +752,9 @@ class ParquetExportState:
             if not isinstance(rel_path, str):
                 continue
             part_paths.append(self.state_dir / rel_path)
-        assemble_parquet_from_parts(
+        assemble_jsonl_from_parts(
             output=self.output,
             part_paths=part_paths,
-            compression=self.compression,
-            row_group_size=self.row_group_size,
         )
 
     def cleanup(self) -> None:
@@ -803,8 +774,6 @@ def infer_input_format(input_file: Path, input_format: str | None) -> str:
     """Infer import format from extension unless explicitly set."""
     if input_format:
         return input_format
-    if input_file.suffix.lower() == ".parquet":
-        return "parquet"
     return "jsonl"
 
 
@@ -1224,7 +1193,7 @@ def delete(search_id: str) -> None:
 @click.option(
     "--format",
     "output_format",
-    type=click.Choice(["json", "jsonl", "parquet"]),
+    type=click.Choice(["json", "jsonl"]),
     default="jsonl",
     help="Output format (default: jsonl)",
 )
@@ -1258,27 +1227,21 @@ def delete(search_id: str) -> None:
     help="Maximum adaptive page size (default: 5000)",
 )
 @click.option(
-    "--parquet-compression",
-    type=click.Choice(["zstd", "snappy", "gzip", "none"]),
+    "--compression",
+    type=click.Choice(["zstd", "none"]),
     default="zstd",
-    help="Parquet compression codec (default: zstd)",
-)
-@click.option(
-    "--parquet-row-group-size",
-    default=50000,
-    type=int,
-    help="Rows per parquet row group (default: 50000)",
+    help="JSONL compression codec (default: zstd)",
 )
 @click.option(
     "--resume/--no-resume",
     default=True,
-    help="Resume interrupted parquet exports from local state (default: enabled)",
+    help="Resume interrupted exports from local state (default: enabled)",
 )
 @click.option(
     "--restart",
     is_flag=True,
     default=False,
-    help="Discard existing parquet resume state and start over",
+    help="Discard existing export resume state and start over",
 )
 @click.option(
     "--keep-alive",
@@ -1338,8 +1301,7 @@ def export(
     adaptive_page_size: bool,
     min_page_size: int,
     max_page_size: int,
-    parquet_compression: str,
-    parquet_row_group_size: int,
+    compression: str,
     resume: bool,
     restart: bool,
     keep_alive: str,
@@ -1371,11 +1333,8 @@ def export(
     if workers < 0:
         console.print("[red]--workers cannot be negative.[/red]")
         raise SystemExit(1)
-    if parquet_row_group_size <= 0:
-        console.print("[red]--parquet-row-group-size must be greater than 0.[/red]")
-        raise SystemExit(1)
-    if output_format == "parquet" and not output:
-        console.print("[red]Parquet export requires --output.[/red]")
+    if output_format == "jsonl" and compression == "zstd" and not output:
+        console.print("[red]Zstd export requires --output.[/red]")
         raise SystemExit(1)
     if restart and not resume:
         console.print("[red]--restart cannot be combined with --no-resume.[/red]")
@@ -1539,30 +1498,32 @@ def export(
             f"{' and adaptive page sizing' if adaptive_page_size else ''}..."
         )
 
-    parquet_state: ParquetExportState | None = None
+    export_state: JsonlExportState | None = None
     resumed = False
-    if output_format == "parquet":
+    if output_format == "jsonl" and output:
         assert output is not None
-        parquet_state = ParquetExportState(
+        export_state = JsonlExportState(
             output=output,
             index=index,
             query=query,
             workers=resolved_workers,
-            compression=parquet_compression,
-            row_group_size=parquet_row_group_size,
+            compression=compression,
         )
-        resumed = parquet_state.start(resume=resume, restart=restart)
+        resumed = export_state.start(resume=resume, restart=restart)
         if resumed:
             console.print(
                 "Resuming export from existing state "
-                f"({parquet_state.pages_written} pages, {parquet_state.docs_written:,} docs)."
+                f"({export_state.pages_written} pages, {export_state.docs_written:,} docs)."
             )
 
     if output_format == "json":
         all_hits: list[dict[str, Any]] = []
         sink: HitSink | None = None
     elif output_format == "jsonl":
-        sink = JsonlSink(output)
+        if export_state is not None:
+            sink = None
+        else:
+            sink = JsonlSink(output)
         all_hits = []
     else:
         sink = None
@@ -1602,7 +1563,7 @@ def export(
         failed = False
         try:
             worker_resume_state = (
-                parquet_state.worker_state(worker_id) if parquet_state else None
+                export_state.worker_state(worker_id) if export_state else None
             )
             if worker_resume_state and bool(worker_resume_state.get("done")):
                 return
@@ -1721,16 +1682,16 @@ def export(
                     pass
             enqueue_chunk(ExportWorkerDone(worker_id=worker_id, success=not failed))
 
-    docs_written = parquet_state.docs_written if parquet_state else 0
-    pages = parquet_state.pages_written if parquet_state else 0
+    docs_written = export_state.docs_written if export_state else 0
+    pages = export_state.pages_written if export_state else 0
     recent_page_size = page_size
     fetch_started_at = time.perf_counter()
     recent_docs: deque[tuple[float, int]] = deque()
     worker_docs: dict[int, int] = {}
     for worker_id in range(resolved_workers):
         worker_doc_count = 0
-        if parquet_state:
-            worker_state = parquet_state.worker_state(worker_id)
+        if export_state:
+            worker_state = export_state.worker_state(worker_id)
             worker_doc_count = int(worker_state.get("docs_written", 0))
         worker_docs[worker_id] = worker_doc_count
     worker_started_at: dict[int, float] = {
@@ -1785,8 +1746,8 @@ def export(
                 except Empty:
                     continue
                 if isinstance(chunk, ExportWorkerDone):
-                    if parquet_state and chunk.success:
-                        parquet_state.mark_worker_done(chunk.worker_id)
+                    if export_state and chunk.success:
+                        export_state.mark_worker_done(chunk.worker_id)
                     worker_finished.add(chunk.worker_id)
                     finished_workers += 1
                     continue
@@ -1798,8 +1759,8 @@ def export(
                     continue
 
                 pages += 1
-                if parquet_state:
-                    parquet_state.record_chunk(chunk)
+                if export_state:
+                    export_state.record_chunk(chunk)
                 elif sink:
                     sink.write_hits(chunk.hits)
                 else:
@@ -1907,12 +1868,12 @@ def export(
         console.print(f"[red]Export failed:[/red] {worker_errors[0]}")
         raise SystemExit(1)
 
-    if parquet_state:
+    if export_state:
         try:
-            parquet_state.finalize_output()
-            parquet_state.cleanup()
+            export_state.finalize_output()
+            export_state.cleanup()
         except Exception as e:
-            console.print(f"[red]Export failed while finalizing parquet:[/red] {e}")
+            console.print(f"[red]Export failed while finalizing output:[/red] {e}")
             raise SystemExit(1) from e
 
     final_count = docs_written if docs_written > 0 else len(all_hits)
@@ -1944,11 +1905,11 @@ def export(
     "-i",
     required=True,
     type=click.Path(exists=True, path_type=Path),
-    help="Path to export file (jsonl or parquet)",
+    help="Path to export file (jsonl or jsonl.zst)",
 )
 @click.option(
     "--input-format",
-    type=click.Choice(["jsonl", "parquet"]),
+    type=click.Choice(["jsonl"]),
     default=None,
     help="Input format (default: inferred from extension)",
 )
@@ -1985,11 +1946,14 @@ def import_docs(
     username: str | None,
     password: str | None,
 ) -> None:
-    """Import JSONL or Parquet hits into Elasticsearch using bulk create operations."""
+    """Import JSONL hits into Elasticsearch using bulk create operations."""
     if batch_size <= 0:
         console.print("[red]--batch-size must be greater than 0.[/red]")
         raise SystemExit(1)
     resolved_input_format = infer_input_format(input_file, input_format)
+    if resolved_input_format != "jsonl":
+        console.print("[red]Only jsonl input format is supported.[/red]")
+        raise SystemExit(1)
 
     client = create_client(
         url=url,
@@ -2076,59 +2040,22 @@ def import_docs(
             raise SystemExit(1)
 
         console.print(f"[bold]Starting import into {index}[/bold]")
-        if resolved_input_format == "jsonl":
-            with input_file.open() as f:
-                for line_number, line in enumerate(f, start=1):
-                    if not line.strip():
-                        continue
-                    try:
-                        hit = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        console.print(
-                            f"[red]Invalid JSON at line {line_number}:[/red] {e.msg}"
-                        )
-                        raise SystemExit(1)
-                    process_hit(hit, line_number)
-        else:
-            try:
-                import pyarrow.parquet as pq
-            except ImportError:
-                console.print(
-                    "[red]Parquet support requires pyarrow. Install with:[/red] "
-                    "[bold]uv sync[/bold]"
-                )
-                raise SystemExit(1)
-
-            parquet_file = pq.ParquetFile(str(input_file))
-            line_number = 0
-            for batch in parquet_file.iter_batches():
-                batch_rows = batch.to_pylist()
-                for row in batch_rows:
-                    line_number += 1
-                    if not isinstance(row, dict):
-                        console.print("[red]Invalid parquet row format.[/red]")
-                        raise SystemExit(1)
-
-                    hit_json = row.get("hit_json")
-                    if not isinstance(hit_json, str):
-                        console.print(
-                            (
-                                f"[red]Parquet row {line_number} missing string "
-                                "'hit_json'.[/red]"
-                            )
-                        )
-                        raise SystemExit(1)
-                    try:
-                        hit = json.loads(hit_json)
-                    except json.JSONDecodeError as e:
-                        console.print(
-                            (
-                                f"[red]Invalid hit_json at parquet row "
-                                f"{line_number}:[/red] {e.msg}"
-                            )
-                        )
-                        raise SystemExit(1)
-                    process_hit(hit, line_number)
+        compression = "zstd" if input_file.suffix.lower() == ".zst" else "none"
+        line_number = 0
+        try:
+            for line in iter_jsonl_lines(input_file, compression):
+                line_number += 1
+                try:
+                    hit = json.loads(line)
+                except json.JSONDecodeError as e:
+                    console.print(
+                        f"[red]Invalid JSON at line {line_number}:[/red] {e.msg}"
+                    )
+                    raise SystemExit(1)
+                process_hit(hit, line_number)
+        except RuntimeError as e:
+            console.print(f"[red]Failed to read input:[/red] {e}")
+            raise SystemExit(1) from e
 
         flush_batch()
 

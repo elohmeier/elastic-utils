@@ -97,48 +97,48 @@ Full export using async search + PIT pagination (handles frozen indices):
 
 ```bash
 # Export all matching documents
-elastic-utils search export --index alias-frozen --query-file query.json -o results.jsonl
+elastic-utils search export --index alias-frozen --query-file query.json -o results.jsonl.zst
 
 # With time range (gentler on frozen indices)
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --from-date 2025-01-01 --to-date 2025-02-01 -o jan-results.jsonl
+  --from-date 2025-01-01 --to-date 2025-02-01 -o jan-results.jsonl.zst
 
 # Custom page size
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --page-size 500 --keep-alive 15m -o results.jsonl
+  --page-size 500 --keep-alive 15m -o results.jsonl.zst
 
 # By default, export fails if preflight reports shard failures.
 # Override only when partial results are acceptable:
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --allow-shard-failures -o results.jsonl
+  --allow-shard-failures -o results.jsonl.zst
 
 # Parallel sliced export with adaptive paging
 elastic-utils search export --index alias-frozen --query-file query.json \
   --workers 4 --adaptive-page-size --min-page-size 500 --max-page-size 4000 \
-  -o results.jsonl
+  -o results.jsonl.zst
 
-# Streaming parquet export (better compression)
+# Uncompressed JSONL (stdout/files)
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --format parquet --parquet-compression zstd -o results.parquet
+  --compression none -o results.jsonl
 
-# Resumable parquet export (default): if interrupted, rerun same command
+# Resumable export (default): if interrupted, rerun same command
 # to continue from local state in:
-#   results.parquet.elastic-utils-export-state/
+#   results.jsonl.zst.elastic-utils-export-state/
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --format parquet -o results.parquet
+  -o results.jsonl.zst
 
 # Disable resume auto-detection (fails if state exists)
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --format parquet -o results.parquet --no-resume
+  -o results.jsonl.zst --no-resume
 
 # Force a clean restart by discarding existing state
 elastic-utils search export --index alias-frozen --query-file query.json \
-  --format parquet -o results.parquet --restart
+  -o results.jsonl.zst --restart
 
 # Export with explicit source credentials (instead of stored auth)
 elastic-utils search export --index alias-frozen --query-file query.json \
   --url http://source-es:9200 --username elastic --password secret \
-  -o results.jsonl
+  -o results.jsonl.zst
 ```
 
 ### Import exported results
@@ -149,14 +149,13 @@ Import raw-hit JSONL created by `search export` into an existing destination ind
 elastic-utils search import --index logs-restored --input results.jsonl \
   --url http://dest-es:9200 --username elastic --password secret
 
+# Compressed input (auto-detected by .zst extension)
+elastic-utils search import --index logs-restored --input results.jsonl.zst \
+  --url http://dest-es:9200 --username elastic --password secret
+
 # API key auth
 elastic-utils search import --index logs-restored --input results.jsonl \
   --url http://dest-es:9200 --api-key-id <id> --api-key <key>
-
-# Import parquet raw-hit export
-elastic-utils search import --index logs-restored --input results.parquet \
-  --input-format parquet \
-  --url http://dest-es:9200 --username elastic --password secret
 ```
 
 Import behavior:
@@ -300,8 +299,6 @@ elastic-utils jsonl extract \
 ```bash
 uv tool install 'git+https://github.com/elohmeier/elastic-utils[xlsx]'
 ```
-
-Parquet export/import is supported by default (pyarrow is installed as a core dependency).
 
 ## Development
 
