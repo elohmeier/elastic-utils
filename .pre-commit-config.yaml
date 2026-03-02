@@ -1,0 +1,52 @@
+fail_fast: true
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        stages: [pre-push]
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.36.0
+    hooks:
+      - id: check-github-workflows
+        stages: [pre-push]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.11
+    hooks:
+      - id: ruff
+        name: Check and fix Python code with Ruff
+        args: [--fix, --exit-zero]
+        stages: [pre-push]
+      - id: ruff-format
+        name: Format Python code with Ruff
+        stages: [pre-push]
+
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: Type check Python code with ty
+        entry: uv run ty check
+        language: system
+        types: [python]
+        pass_filenames: true
+        stages: [pre-push]
+
+  - repo: local
+    hooks:
+      - id: uv-lock
+        name: Validate uv.lock
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: dprint
+        name: Format code with dprint
+        entry: bunx dprint fmt
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

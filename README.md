@@ -160,6 +160,7 @@ elastic-utils search import --index logs-restored --input results.parquet \
 ```
 
 Import behavior:
+
 - Preserves source `_id`
 - Uses bulk `create` operations
 - Skips duplicates as conflicts (does not overwrite existing documents)

@@ -22,6 +22,7 @@ from rich.progress import (
     BarColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
@@ -1769,7 +1770,7 @@ def export(
                 total=total_docs if total_docs > 0 else None,
                 completed=docs_written,
             )
-            worker_task_ids: dict[int, int] = {}
+            worker_task_ids: dict[int, TaskID] = {}
             if worker_progress:
                 slots = min(worker_progress_top_n, resolved_workers)
                 for slot in range(slots):
