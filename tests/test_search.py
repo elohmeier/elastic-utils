@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -1035,6 +1036,75 @@ def test_search_export_retries_read_timeout(
     assert result.exit_code == 0
     assert "Export complete" in result.output
     assert output_file.exists()
+
+
+def test_search_export_no_adaptive_uses_requested_page_size(
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    """Export should honor --page-size when adaptive sizing is disabled."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.jsonl"
+
+    shards = MagicMock()
+    shards.total = 1
+    shards.successful = 1
+    shards.skipped = 0
+    shards.failed = 0
+    shards.failures = []
+
+    poll_result = MagicMock()
+    poll_result.is_running = False
+    poll_result.response.shards = shards
+    poll_result.total_hits = 1
+
+    first_request_size: int | None = None
+
+    def fake_search_with_pit_raw(
+        request: dict[str, Any],
+        timeout: float,
+    ) -> dict[str, Any]:
+        nonlocal first_request_size
+        if first_request_size is None:
+            first_request_size = request.get("size")
+            return {
+                "hits": {
+                    "hits": [{"_id": "1", "_source": {"message": "test"}, "sort": [1]}]
+                },
+                "pit_id": "pit-2",
+            }
+        return {"hits": {"hits": []}}
+
+    mock_client = MagicMock()
+    mock_client.session.return_value.__enter__.return_value = mock_client
+    mock_client.session.return_value.__exit__.return_value = None
+    mock_client.async_search_submit.return_value.id = "search-id"
+    mock_client.async_search_poll.side_effect = [poll_result]
+    mock_client.primary_shard_count.return_value = 1
+    mock_client.search_with_pit_raw.side_effect = fake_search_with_pit_raw
+
+    with patch("elastic_utils.search.create_client", return_value=mock_client):
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--no-adaptive-page-size",
+                "--page-size",
+                "8000",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Export complete" in result.output
+    assert first_request_size == 8000
 
 
 def test_search_export_fails_on_preflight_shard_failures_by_default(

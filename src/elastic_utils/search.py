@@ -1185,7 +1185,12 @@ def export(
         try:
             with local_client.session():
                 pit_id = local_client.open_pit(index, keep_alive=keep_alive)
-                local_page_size = max(min(page_size, max_page_size), min_page_size)
+                if adaptive_page_size:
+                    local_page_size = max(
+                        min(page_size, max_page_size), min_page_size
+                    )
+                else:
+                    local_page_size = page_size
                 search_after = None
                 while not stop_event.is_set():
                     pit_query = query.copy()
