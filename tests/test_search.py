@@ -318,7 +318,7 @@ def test_search_status_success(runner: CliRunner, authenticated_creds: Path) -> 
             "_shards": {"total": 10, "successful": 10, "skipped": 0, "failed": 0},
             "took": 1234,
             "timed_out": False,
-            "hits": {"hits": [{"_id": "1"}, {"_id": "2"}]},
+            "hits": {"total": {"value": 38412726, "relation": "eq"}, "hits": []},
         },
     }
 
@@ -328,7 +328,8 @@ def test_search_status_success(runner: CliRunner, authenticated_creds: Path) -> 
     assert result.exit_code == 0
     assert "Complete" in result.output
     assert "10/10" in result.output
-    assert "1234ms" in result.output
+    assert "1.23s" in result.output
+    assert "38.4M (38,412,726)" in result.output
 
 
 def test_search_debug_shards_with_failures(

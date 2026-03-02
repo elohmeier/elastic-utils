@@ -25,7 +25,14 @@ from rich.progress import (
 )
 
 from .client import ElasticsearchClient
-from .formatting import format_hits, format_shards, write_output
+from .formatting import (
+    format_compact_number,
+    format_duration_ms,
+    format_hits,
+    format_human_number,
+    format_shards,
+    write_output,
+)
 from .models import TotalHits
 
 console = Console()
@@ -72,6 +79,34 @@ def read_query(query_file: Path | None) -> dict[str, Any]:
     except json.JSONDecodeError as e:
         console.print(f"[red]Invalid JSON:[/red] {e}")
         raise SystemExit(1)
+
+
+def format_total_hits_label(total: TotalHits | int | None) -> str | None:
+    """Format total hits for status/progress output when available."""
+    if total is None:
+        return None
+    if isinstance(total, TotalHits):
+        value = format_human_number(total.value)
+        if total.relation == "gte":
+            return f">= {value}"
+        return value
+    if isinstance(total, int):
+        return format_human_number(total)
+    return None
+
+
+def format_total_hits_progress(total: TotalHits | int | None) -> str | None:
+    """Format total hits compactly for progress descriptions."""
+    if total is None:
+        return None
+    if isinstance(total, TotalHits):
+        value = format_compact_number(total.value)
+        if total.relation == "gte":
+            return f">={value}"
+        return value
+    if isinstance(total, int):
+        return format_compact_number(total)
+    return None
 
 
 def print_shard_failures(
@@ -607,8 +642,9 @@ def status(search_id: str, wait_for: str | None) -> None:
     )
     console.print(f"  Partial: {result.is_partial}")
     console.print(f"  Shards: {format_shards(result.response.shards)}")
-    console.print(f"  Took: {result.response.took}ms")
-    console.print(f"  Hits returned: {result.total_hits}")
+    console.print(f"  Took: {format_duration_ms(result.response.took)}")
+    hits_label = format_total_hits_label(result.response.hits.total)
+    console.print(f"  Hits returned: {hits_label if hits_label else 'unknown'}")
 
 
 @search.command(name="debug-shards")
@@ -682,7 +718,7 @@ def debug_shards(
     )
     console.print(f"  Partial: {result.is_partial}")
     console.print(f"  Shards: {format_shards(result.response.shards)}")
-    console.print(f"  Took: {result.response.took}ms")
+    console.print(f"  Took: {format_duration_ms(result.response.took)}")
 
     if failed <= 0:
         console.print("[green]No failed shards reported.[/green]")
@@ -761,7 +797,18 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
                 task,
                 total=shards.total,
                 completed=shards.successful,
-                description=f"(skipped: {shards.skipped}, failed: {shards.failed})",
+                description=(
+                    f"(skipped: {shards.skipped}, failed: {shards.failed})"
+                    + (
+                        f", hits: {hits_progress}"
+                        if (
+                            hits_progress := format_total_hits_progress(
+                                result.response.hits.total
+                            )
+                        )
+                        else ""
+                    )
+                ),
             )
 
             if not result.is_running:
@@ -777,8 +824,9 @@ def wait(search_id: str, interval: int, timeout: int | None) -> None:
     if result:
         console.print("[green]Search complete![/green]")
         console.print(f"  Shards: {format_shards(result.response.shards)}")
-        console.print(f"  Took: {result.response.took}ms")
-        console.print(f"  Hits returned: {result.total_hits}")
+        console.print(f"  Took: {format_duration_ms(result.response.took)}")
+        hits_label = format_total_hits_label(result.response.hits.total)
+        console.print(f"  Hits returned: {hits_label if hits_label else 'unknown'}")
 
 
 @search.command()
@@ -1074,6 +1122,15 @@ def export(
                         completed=shards.successful,
                         description=(
                             f"(skipped: {shards.skipped}, failed: {shards.failed})"
+                            + (
+                                f", hits: {hits_progress}"
+                                if (
+                                    hits_progress := format_total_hits_progress(
+                                        result.response.hits.total
+                                    )
+                                )
+                                else ""
+                            )
                         ),
                     )
                     if not result.is_running:
@@ -1102,7 +1159,8 @@ def export(
             )
         elif isinstance(total_hits_obj, TotalHits) and total_hits_obj.relation == "gte":
             console.print(
-                f"Initial search complete, total matching docs: >= {total_docs:,}"
+                "Initial search complete, total matching docs: "
+                f">= {format_human_number(total_docs)}"
             )
             console.print(
                 '[yellow]Hint:[/yellow] add [bold]"track_total_hits": true[/bold] '
@@ -1110,7 +1168,8 @@ def export(
             )
         else:
             console.print(
-                f"Initial search complete, total matching docs: {total_docs:,}"
+                "Initial search complete, total matching docs: "
+                f"{format_human_number(total_docs)}"
             )
         if result and result.response.shards.failed > 0:
             failed = result.response.shards.failed
@@ -1357,7 +1416,9 @@ def export(
         raise SystemExit(1)
 
     final_count = docs_written if docs_written > 0 else len(all_hits)
-    console.print(f"[green]Export complete! Total documents: {final_count:,}[/green]")
+    console.print(
+        f"[green]Export complete! Total documents: {format_human_number(final_count)}[/green]"
+    )
 
     if output_format == "json":
         formatted = format_hits(all_hits, output_format)

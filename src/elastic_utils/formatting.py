@@ -14,6 +14,58 @@ def format_shards(shards: Shards) -> str:
     return f"{shards.successful}/{shards.total} (skipped: {shards.skipped}, failed: {shards.failed})"
 
 
+def format_compact_number(value: int) -> str:
+    """Format large integers using metric suffixes (K, M, B, T)."""
+    abs_value = abs(value)
+    if abs_value < 1_000:
+        return str(value)
+
+    suffixes = (
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    )
+    for base, suffix in suffixes:
+        if abs_value >= base:
+            scaled = value / base
+            if abs(scaled) >= 100:
+                rendered = f"{scaled:.0f}"
+            elif abs(scaled) >= 10:
+                rendered = f"{scaled:.1f}"
+            else:
+                rendered = f"{scaled:.2f}"
+            return f"{rendered.rstrip('0').rstrip('.')}{suffix}"
+    return str(value)
+
+
+def format_human_number(value: int) -> str:
+    """Format integers with compact and exact forms."""
+    compact = format_compact_number(value)
+    if abs(value) < 1_000:
+        return compact
+    return f"{compact} ({value:,})"
+
+
+def format_duration_ms(milliseconds: int) -> str:
+    """Format millisecond durations as a human-readable string."""
+    if milliseconds < 1_000:
+        return f"{milliseconds}ms"
+    if milliseconds < 60_000:
+        seconds = milliseconds / 1_000
+        if seconds >= 10:
+            return f"{seconds:.1f}s"
+        seconds_text = f"{seconds:.2f}".rstrip("0").rstrip(".")
+        return f"{seconds_text}s"
+
+    total_seconds = milliseconds // 1_000
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    return f"{minutes}m {seconds}s"
+
+
 def format_hits(
     hits: list[dict[str, Any]],
     output_format: str,
