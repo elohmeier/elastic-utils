@@ -56,6 +56,7 @@ def test_search_help(runner: CliRunner) -> None:
     assert "submit" in result.output
     assert "count" in result.output
     assert "status" in result.output
+    assert "running" in result.output
     assert "wait" in result.output
     assert "debug-shards" in result.output
     assert "get" in result.output
@@ -330,6 +331,58 @@ def test_search_status_success(runner: CliRunner, authenticated_creds: Path) -> 
     assert "10/10" in result.output
     assert "1.23s" in result.output
     assert "38.4M (38,412,726)" in result.output
+
+
+def test_search_running_success(runner: CliRunner, authenticated_creds: Path) -> None:
+    """Running command should show active async-search tasks."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "nodes": {
+            "node-a": {
+                "name": "es-hot-01",
+                "tasks": {
+                    "node-a:441": {
+                        "node": "node-a",
+                        "id": 441,
+                        "action": "indices:data/read/async_search",
+                        "running_time_in_nanos": 12_340_000_000,
+                        "description": "indices[alias-complete], source[...]",
+                        "cancellable": True,
+                    },
+                    "node-a:442": {
+                        "node": "node-a",
+                        "id": 442,
+                        "action": "indices:data/read/async_search/get",
+                        "running_time_in_nanos": 2_100_000_000,
+                        "description": "id[abc123]",
+                        "cancellable": False,
+                    },
+                },
+            }
+        }
+    }
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(cli, ["search", "running"])
+
+    assert result.exit_code == 0
+    assert "Running async searches: 2" in result.output
+    assert "node-a:441" in result.output
+    assert "node-a:442" in result.output
+    assert "12.3s" in result.output
+    assert "2.1s" in result.output
+
+
+def test_search_running_none(runner: CliRunner, authenticated_creds: Path) -> None:
+    """Running command should report no active async-search tasks."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"nodes": {}}
+
+    with patch("elastic_utils.client.httpx.request", return_value=mock_response):
+        result = runner.invoke(cli, ["search", "running"])
+
+    assert result.exit_code == 0
+    assert "No running async searches found" in result.output
 
 
 def test_search_debug_shards_with_failures(

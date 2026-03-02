@@ -402,6 +402,81 @@ class ElasticsearchClient:
         )
         return response is not None
 
+    def async_search_running_tasks(self) -> list[dict[str, Any]]:
+        """List currently running async-search tasks from the tasks API."""
+        response = self.get(
+            "/_tasks",
+            params={
+                "actions": "*async_search*",
+                "detailed": "true",
+                "group_by": "none",
+            },
+            timeout=30.0,
+        )
+        assert response is not None
+        payload = response.json()
+
+        has_tasks_root = "tasks" in payload
+        tasks_root = payload.get("tasks", {})
+        tasks: list[dict[str, Any]] = []
+
+        if has_tasks_root and isinstance(tasks_root, dict):
+            for task_key, task in tasks_root.items():
+                if not isinstance(task, dict):
+                    continue
+                task_id = str(task.get("task_id") or task_key)
+                action = str(task.get("action", ""))
+                if "async_search" not in action:
+                    continue
+                running_time_in_nanos = task.get("running_time_in_nanos", 0)
+                if not isinstance(running_time_in_nanos, int):
+                    running_time_in_nanos = 0
+                tasks.append(
+                    {
+                        "task_id": task_id,
+                        "action": action,
+                        "running_time_in_nanos": running_time_in_nanos,
+                        "description": str(task.get("description", "")),
+                        "node": str(task.get("node", "")),
+                        "cancellable": bool(task.get("cancellable", False)),
+                    }
+                )
+            tasks.sort(key=lambda item: item["running_time_in_nanos"], reverse=True)
+            return tasks
+
+        # Fallback for nested node-shaped payloads (older/custom responses)
+        nodes = payload.get("nodes", {})
+        if not isinstance(nodes, dict):
+            return tasks
+        for node_id, node_payload in nodes.items():
+            if not isinstance(node_payload, dict):
+                continue
+            node_name = str(node_payload.get("name", node_id))
+            node_tasks = node_payload.get("tasks", {})
+            if not isinstance(node_tasks, dict):
+                continue
+            for task_key, task in node_tasks.items():
+                if not isinstance(task, dict):
+                    continue
+                action = str(task.get("action", ""))
+                if "async_search" not in action:
+                    continue
+                running_time_in_nanos = task.get("running_time_in_nanos", 0)
+                if not isinstance(running_time_in_nanos, int):
+                    running_time_in_nanos = 0
+                tasks.append(
+                    {
+                        "task_id": str(task.get("task_id") or task_key),
+                        "action": action,
+                        "running_time_in_nanos": running_time_in_nanos,
+                        "description": str(task.get("description", "")),
+                        "node": node_name,
+                        "cancellable": bool(task.get("cancellable", False)),
+                    }
+                )
+        tasks.sort(key=lambda item: item["running_time_in_nanos"], reverse=True)
+        return tasks
+
     def count(
         self,
         index: str,

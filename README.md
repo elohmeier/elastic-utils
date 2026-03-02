@@ -52,6 +52,13 @@ elastic-utils search status <search-id>
 elastic-utils search status <search-id> --wait-for 5s  # Wait up to 5s for completion
 ```
 
+### List running async searches
+
+```bash
+elastic-utils search running
+elastic-utils search running --output json
+```
+
 ### Wait for completion
 
 ```bash

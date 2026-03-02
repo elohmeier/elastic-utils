@@ -28,6 +28,7 @@ from .client import ElasticsearchClient
 from .formatting import (
     format_compact_number,
     format_duration_ms,
+    format_duration_ns,
     format_hits,
     format_human_number,
     format_shards,
@@ -645,6 +646,46 @@ def status(search_id: str, wait_for: str | None) -> None:
     console.print(f"  Took: {format_duration_ms(result.response.took)}")
     hits_label = format_total_hits_label(result.response.hits.total)
     console.print(f"  Hits returned: {hits_label if hits_label else 'unknown'}")
+
+
+@search.command()
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format (default: text).",
+)
+def running(output_format: str) -> None:
+    """List currently running async searches."""
+    client = ElasticsearchClient.from_credentials(console)
+    tasks = client.async_search_running_tasks()
+
+    if output_format == "json":
+        console.print(json.dumps({"count": len(tasks), "tasks": tasks}, indent=2))
+        return
+
+    if not tasks:
+        console.print("[green]No running async searches found.[/green]")
+        return
+
+    console.print(f"[yellow]Running async searches: {len(tasks)}[/yellow]")
+    for task in tasks:
+        task_id = task.get("task_id", "?")
+        action = task.get("action", "unknown")
+        running_nanos = task.get("running_time_in_nanos", 0)
+        if not isinstance(running_nanos, int):
+            running_nanos = 0
+        running_time = format_duration_ns(running_nanos)
+        node = task.get("node", "?")
+        cancellable = "yes" if task.get("cancellable") else "no"
+        description = str(task.get("description", "")).strip()
+        console.print(
+            f"  {task_id}  {running_time}  {action}  "
+            f"node={node} cancellable={cancellable}"
+        )
+        if description:
+            console.print(f"    {description}")
 
 
 @search.command(name="debug-shards")

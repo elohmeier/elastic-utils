@@ -66,6 +66,14 @@ def format_duration_ms(milliseconds: int) -> str:
     return f"{minutes}m {seconds}s"
 
 
+def format_duration_ns(nanoseconds: int) -> str:
+    """Format nanosecond durations as a human-readable string."""
+    if nanoseconds < 1_000_000:
+        return "<1ms"
+    milliseconds = int(round(nanoseconds / 1_000_000))
+    return format_duration_ms(milliseconds)
+
+
 def format_hits(
     hits: list[dict[str, Any]],
     output_format: str,
