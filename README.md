@@ -141,6 +141,34 @@ elastic-utils search export --index alias-frozen --query-file query.json \
   -o results.jsonl.zst
 ```
 
+### Generate Export Script from Planner
+
+Generate a runnable bash script with pre-expanded `search export` calls based on
+`plan-export` batches:
+
+```bash
+scripts/generate-export-script.sh \
+  --index my-alias \
+  --query-file foo-query-prod.json \
+  --prefix foo-prod \
+  --window week \
+  --target-docs 200000000
+
+# Then run:
+./tmp/run-exports.sh
+```
+
+Tune worker counts by dominant tier:
+
+```bash
+scripts/generate-export-script.sh \
+  --index my-alias \
+  --query-file foo-query-prod.json \
+  --cold-workers 8 \
+  --frozen-workers 2 \
+  --default-workers 4
+```
+
 ### Import exported results
 
 Import raw-hit JSONL created by `search export` into an existing destination index:
