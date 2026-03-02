@@ -127,6 +127,13 @@ elastic-utils search export --index alias-frozen --query-file query.json \
 elastic-utils search export --index alias-frozen --query-file query.json \
   -o results.jsonl.zst
 
+# Safety default: if output file already exists and there is no resume state,
+# export is skipped (exit code 0). Override behavior if needed:
+elastic-utils search export --index alias-frozen --query-file query.json \
+  -o results.jsonl.zst --on-existing-output error
+elastic-utils search export --index alias-frozen --query-file query.json \
+  -o results.jsonl.zst --on-existing-output overwrite
+
 # Disable resume auto-detection (fails if state exists)
 elastic-utils search export --index alias-frozen --query-file query.json \
   -o results.jsonl.zst --no-resume

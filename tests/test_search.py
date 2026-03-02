@@ -164,6 +164,70 @@ def test_search_export_rejects_non_positive_worker_progress_top_n(
     assert "--worker-progress-top-n must be greater than 0" in result.output
 
 
+def test_search_export_skips_when_output_exists_by_default(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Export should skip by default when output exists without resume state."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.jsonl"
+    output_file.write_text("already-done\n")
+
+    with patch("elastic_utils.search.create_client") as create_client_mock:
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--compression",
+                "none",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Skipping export" in result.output
+    create_client_mock.assert_not_called()
+
+
+def test_search_export_errors_when_output_exists_and_error_mode(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Export should fail when output exists and --on-existing-output=error."""
+    query_file = tmp_path / "query.json"
+    query_file.write_text('{"query":{"match_all":{}}}')
+    output_file = tmp_path / "output.jsonl"
+    output_file.write_text("already-done\n")
+
+    with patch("elastic_utils.search.create_client") as create_client_mock:
+        result = runner.invoke(
+            cli,
+            [
+                "search",
+                "export",
+                "--index",
+                "source-index",
+                "--query-file",
+                str(query_file),
+                "--output",
+                str(output_file),
+                "--compression",
+                "none",
+                "--on-existing-output",
+                "error",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Output already exists" in result.output
+    create_client_mock.assert_not_called()
+
+
 def _export_query_for_fingerprint(page_size: int) -> dict[str, Any]:
     return {
         "query": {"match_all": {}},

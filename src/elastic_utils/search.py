@@ -1976,6 +1976,13 @@ def delete(search_id: str) -> None:
     help="Discard existing export resume state and start over",
 )
 @click.option(
+    "--on-existing-output",
+    type=click.Choice(["skip", "error", "overwrite"]),
+    default="skip",
+    show_default=True,
+    help=("Behavior when output file already exists and no resume state is present."),
+)
+@click.option(
     "--keep-alive",
     default="10m",
     help="PIT keep-alive duration (default: 10m)",
@@ -2036,6 +2043,7 @@ def export(
     compression: str,
     resume: bool,
     restart: bool,
+    on_existing_output: str,
     keep_alive: str,
     request_timeout: float,
     max_timeout_retries: int,
@@ -2080,6 +2088,24 @@ def export(
     if worker_progress_top_n <= 0:
         console.print("[red]--worker-progress-top-n must be greater than 0.[/red]")
         raise SystemExit(1)
+
+    resume_manifest_exists = False
+    if output and output_format == "jsonl":
+        state_dir = output.parent / f"{output.name}.elastic-utils-export-state"
+        resume_manifest_exists = (state_dir / "manifest.json").exists()
+
+    if output and output.exists() and not resume_manifest_exists:
+        if on_existing_output == "skip":
+            console.print(
+                f"[yellow]Skipping export:[/yellow] output already exists: {output}"
+            )
+            return
+        if on_existing_output == "error":
+            console.print(
+                "[red]Output already exists.[/red] "
+                "Use [bold]--on-existing-output overwrite[/bold] to replace it."
+            )
+            raise SystemExit(1)
 
     client = create_client(
         url=url,
