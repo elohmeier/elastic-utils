@@ -22,8 +22,16 @@ import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Loads snapshot metadata from S3 without requiring a running Elasticsearch cluster.
@@ -31,6 +39,7 @@ import java.util.List;
 public class SnapshotMetadataLoader {
 
     private static final ProjectRepo DUMMY_REPO = new ProjectRepo(ProjectId.DEFAULT, "_");
+    private static final Pattern INDEX_DATE_PATTERN = Pattern.compile("(\\d{4}\\.\\d{2}\\.\\d{2})");
 
     private final BlobContainer rootContainer;
     private final S3ClientFactory.S3Access s3Access;
@@ -275,6 +284,10 @@ public class SnapshotMetadataLoader {
      * Returns snapshot names sorted by start time (newest first).
      */
     public List<String> findSnapshotsForIndex(String indexNameOrAlias) throws IOException {
+        return listSnapshotsForIndex(indexNameOrAlias).stream().map(s -> s.snapshotId().getName()).toList();
+    }
+
+    public List<SnapshotSummary> listSnapshotsForIndex(String indexNameOrAlias) throws IOException {
         RepositoryData repositoryData = loadRepositoryData();
         var allIndices = repositoryData.getIndices();
         List<SnapshotSummary> matching = new ArrayList<>();
@@ -334,7 +347,65 @@ public class SnapshotMetadataLoader {
 
         // Sort newest first
         matching.sort((a, b) -> Long.compare(b.startTimeMillis(), a.startTimeMillis()));
-        return matching.stream().map(s -> s.snapshotId().getName()).toList();
+        return matching;
+    }
+
+    public List<ExportTarget> findExportTargets(
+        String indexPattern,
+        LocalDate fromIndexDate,
+        LocalDate toIndexDate,
+        boolean latestPerIndex
+    ) throws IOException {
+        List<SnapshotSummary> snapshots = listSnapshots();
+        snapshots.sort(Comparator.comparingLong(SnapshotSummary::startTimeMillis).reversed());
+
+        List<ExportTarget> discovered = new ArrayList<>();
+        for (SnapshotSummary summary : snapshots) {
+            for (String indexName : summary.indices()) {
+                if (!wildcardMatch(indexName, indexPattern)) {
+                    continue;
+                }
+
+                LocalDate indexDate = extractIndexDate(indexName);
+                if (indexDate == null) {
+                    continue;
+                }
+                if (indexDate.isBefore(fromIndexDate) || indexDate.isAfter(toIndexDate)) {
+                    continue;
+                }
+
+                discovered.add(new ExportTarget(
+                    summary.snapshotId().getName(),
+                    indexName,
+                    summary.state(),
+                    summary.startTimeMillis(),
+                    indexDate
+                ));
+            }
+        }
+
+        if (!latestPerIndex) {
+            discovered.sort(Comparator.comparingLong(ExportTarget::snapshotStartTimeMillis));
+            return discovered;
+        }
+
+        Map<String, ExportTarget> latest = new LinkedHashMap<>();
+        for (ExportTarget target : discovered) {
+            latest.putIfAbsent(target.indexName(), target);
+        }
+        List<ExportTarget> result = new ArrayList<>(latest.values());
+        result.sort(Comparator
+            .comparing(ExportTarget::indexDate)
+            .thenComparingLong(ExportTarget::snapshotStartTimeMillis));
+        return result;
+    }
+
+    private static LocalDate extractIndexDate(String indexName) {
+        Matcher matcher = INDEX_DATE_PATTERN.matcher(indexName);
+        if (!matcher.find()) {
+            return null;
+        }
+        return LocalDate.parse(matcher.group(1).replace('.', '-'));
     }
 
     public record ShardSnapshot(int shardId, BlobStoreIndexShardSnapshot snapshot) {}
@@ -342,4 +413,12 @@ public class SnapshotMetadataLoader {
     public record ResolvedIndex(SnapshotId snapshotId, IndexId indexId, IndexMetadata indexMetadata, List<ShardSnapshot> shardSnapshots) {}
 
     public record SnapshotSummary(SnapshotId snapshotId, String state, long startTimeMillis, long endTimeMillis, List<String> indices) {}
+
+    public record ExportTarget(
+        String snapshotName,
+        String indexName,
+        String state,
+        long snapshotStartTimeMillis,
+        LocalDate indexDate
+    ) {}
 }

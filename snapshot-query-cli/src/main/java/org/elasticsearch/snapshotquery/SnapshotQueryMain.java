@@ -20,6 +20,7 @@ public class SnapshotQueryMain extends MultiCommand {
         super("Elasticsearch snapshot query and export tools");
         subcommands.put("query", new SnapshotQueryCli());
         subcommands.put("export", new SnapshotExportCli());
+        subcommands.put("export-range", new ExportRangeCli());
         subcommands.put("snapshots", new ListSnapshotsCli());
     }
 

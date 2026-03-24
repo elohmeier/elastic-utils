@@ -39,6 +39,13 @@ SNAPSHOT_REPO="test-repo"
 SNAPSHOT_NAME="test-snap"
 INDEX_NAME="test-logs"
 ALIAS_NAME="test-logs-alias"
+RANGE_INDEX_ONE=".ds-logs-180-default-2024.01.15-000001"
+RANGE_INDEX_TWO=".ds-logs-180-default-2024.01.16-000002"
+RANGE_INDEX_THREE=".ds-logs-180-default-2024.01.16-000003"
+RANGE_SNAPSHOT_ONE="range-snap-1"
+RANGE_SNAPSHOT_TWO_OLD="range-snap-2-old"
+RANGE_SNAPSHOT_TWO_NEW="range-snap-2-new"
+RANGE_SNAPSHOT_THREE="range-snap-3"
 
 SKIP_BUILD=false
 JAR_PATH=""
@@ -69,6 +76,34 @@ es_api() {
     shift 2
     curl -sf -X "$method" "http://localhost:${ES_HTTP_PORT}${path}" \
         -H 'Content-Type: application/json' "$@"
+}
+
+create_logs_index() {
+    local index_name="$1"
+    es_api PUT "/${index_name}" -d '{
+  "settings": {
+    "number_of_shards": 2,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "message":   { "type": "text" },
+      "level":     { "type": "keyword" },
+      "status":    { "type": "keyword" },
+      "@timestamp": { "type": "date" },
+      "count":     { "type": "long" },
+      "host":      { "type": "keyword" }
+    }
+  }
+}' >/dev/null
+}
+
+create_snapshot() {
+    local snapshot_name="$1" indices="$2"
+    es_api PUT "/_snapshot/${SNAPSHOT_REPO}/${snapshot_name}?wait_for_completion=true" -d "{
+  \"indices\": \"${indices}\",
+  \"include_global_state\": false
+}" >/dev/null
 }
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
@@ -184,22 +219,7 @@ log "Elasticsearch is ready"
 
 log "Creating index [${INDEX_NAME}] and indexing test documents..."
 
-es_api PUT "/${INDEX_NAME}" -d '{
-  "settings": {
-    "number_of_shards": 2,
-    "number_of_replicas": 0
-  },
-  "mappings": {
-    "properties": {
-      "message":   { "type": "text" },
-      "level":     { "type": "keyword" },
-      "status":    { "type": "keyword" },
-      "@timestamp": { "type": "date" },
-      "count":     { "type": "long" },
-      "host":      { "type": "keyword" }
-    }
-  }
-}' | jq -r '.acknowledged' || die "Failed to create index"
+create_logs_index "$INDEX_NAME" || die "Failed to create index"
 
 # Add alias
 log "Adding alias [${ALIAS_NAME}] to index [${INDEX_NAME}]..."
@@ -238,6 +258,29 @@ es_api POST "/${INDEX_NAME}/_refresh" >/dev/null 2>&1 || true
 DOC_COUNT=$(es_api GET "/${INDEX_NAME}/_count" | jq -r '.count')
 log "Indexed ${DOC_COUNT} documents"
 
+log "Creating date-stamped indices for export-range tests..."
+create_logs_index "$RANGE_INDEX_ONE" || die "Failed to create ${RANGE_INDEX_ONE}"
+create_logs_index "$RANGE_INDEX_TWO" || die "Failed to create ${RANGE_INDEX_TWO}"
+create_logs_index "$RANGE_INDEX_THREE" || die "Failed to create ${RANGE_INDEX_THREE}"
+
+es_api POST "/_bulk" -d "
+{\"index\":{\"_index\":\"${RANGE_INDEX_ONE}\",\"_id\":\"1\"}}
+{\"message\":\"range one doc one\",\"level\":\"info\",\"status\":\"ok\",\"@timestamp\":\"2024-01-15T09:00:00Z\",\"count\":1,\"host\":\"range-01\"}
+{\"index\":{\"_index\":\"${RANGE_INDEX_ONE}\",\"_id\":\"2\"}}
+{\"message\":\"range one doc two\",\"level\":\"error\",\"status\":\"error\",\"@timestamp\":\"2024-01-15T10:00:00Z\",\"count\":2,\"host\":\"range-01\"}
+{\"index\":{\"_index\":\"${RANGE_INDEX_TWO}\",\"_id\":\"1\"}}
+{\"message\":\"range two doc one\",\"level\":\"info\",\"status\":\"ok\",\"@timestamp\":\"2024-01-16T09:00:00Z\",\"count\":1,\"host\":\"range-02\"}
+{\"index\":{\"_index\":\"${RANGE_INDEX_TWO}\",\"_id\":\"2\"}}
+{\"message\":\"range two doc two\",\"level\":\"warn\",\"status\":\"warning\",\"@timestamp\":\"2024-01-16T10:00:00Z\",\"count\":2,\"host\":\"range-02\"}
+{\"index\":{\"_index\":\"${RANGE_INDEX_THREE}\",\"_id\":\"1\"}}
+{\"message\":\"range three doc one\",\"level\":\"info\",\"status\":\"ok\",\"@timestamp\":\"2024-01-16T11:00:00Z\",\"count\":1,\"host\":\"range-03\"}
+{\"index\":{\"_index\":\"${RANGE_INDEX_THREE}\",\"_id\":\"2\"}}
+{\"message\":\"range three doc two\",\"level\":\"error\",\"status\":\"error\",\"@timestamp\":\"2024-01-16T12:00:00Z\",\"count\":2,\"host\":\"range-03\"}
+" | jq -r '.errors' || die "Failed to bulk index range test data"
+
+es_api POST "/${RANGE_INDEX_ONE},${RANGE_INDEX_TWO},${RANGE_INDEX_THREE}/_flush" >/dev/null 2>&1 || true
+es_api POST "/${RANGE_INDEX_ONE},${RANGE_INDEX_TWO},${RANGE_INDEX_THREE}/_refresh" >/dev/null 2>&1 || true
+
 # ── Step 5: Create S3 snapshot repository and take snapshot ──────────────────
 
 log "Registering S3 snapshot repository [${SNAPSHOT_REPO}]..."
@@ -263,6 +306,13 @@ es_api PUT "/_snapshot/${SNAPSHOT_REPO}/${SNAPSHOT_NAME}?wait_for_completion=tru
 SNAP_STATE=$(es_api GET "/_snapshot/${SNAPSHOT_REPO}/${SNAPSHOT_NAME}" | jq -r '.snapshots[0].state')
 log "Snapshot state: ${SNAP_STATE}"
 [ "$SNAP_STATE" = "SUCCESS" ] || die "Snapshot failed with state: ${SNAP_STATE}"
+
+log "Creating range snapshots for export-range tests..."
+create_snapshot "$RANGE_SNAPSHOT_ONE" "$RANGE_INDEX_ONE" || die "Failed to create ${RANGE_SNAPSHOT_ONE}"
+create_snapshot "$RANGE_SNAPSHOT_TWO_OLD" "$RANGE_INDEX_TWO" || die "Failed to create ${RANGE_SNAPSHOT_TWO_OLD}"
+sleep 1
+create_snapshot "$RANGE_SNAPSHOT_TWO_NEW" "$RANGE_INDEX_TWO" || die "Failed to create ${RANGE_SNAPSHOT_TWO_NEW}"
+create_snapshot "$RANGE_SNAPSHOT_THREE" "$RANGE_INDEX_THREE" || die "Failed to create ${RANGE_SNAPSHOT_THREE}"
 
 # ── Step 6: Stop Elasticsearch ───────────────────────────────────────────────
 
@@ -746,6 +796,81 @@ if [ -f "$OUTFILE" ]; then
     fi
 else
     fail "auto-discover alias export: output file not created"
+fi
+
+# ── List-snapshots Test 4: JSON output ───────────────────────────────────────
+
+echo -e "\033[1;34m==>\033[0m Test: snapshots --json" >&2
+LIST_JSON=$("$JAVA" -jar "$JAR_PATH" snapshots "${S3_COMMON_ARGS[@]}" --json 2>/dev/null) || true
+
+if echo "$LIST_JSON" | jq -e '.[] | select(.snapshot == "'"$RANGE_SNAPSHOT_ONE"'") | .indices | index("'"$RANGE_INDEX_ONE"'")' >/dev/null 2>&1; then
+    ok "snapshots --json: includes ${RANGE_SNAPSHOT_ONE} with ${RANGE_INDEX_ONE}"
+else
+    fail "snapshots --json: missing ${RANGE_SNAPSHOT_ONE} or indices payload"
+    echo "    Output: $(echo "$LIST_JSON" | head -20)"
+fi
+
+# ── Export Test 10: export-range latest-per-index ────────────────────────────
+
+RANGE_EXPORT_DIR="$EXPORT_DIR/export-range-latest"
+mkdir -p "$RANGE_EXPORT_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: export-range latest-per-index" >&2
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index-pattern '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_DIR" 2>/dev/null || true
+
+FILE_COUNT=$(find "$RANGE_EXPORT_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
+TOTAL_LINES=$(find "$RANGE_EXPORT_DIR" -name '*.jsonl' -exec cat {} \; | wc -l | tr -d ' ')
+if [ "$FILE_COUNT" = "3" ]; then
+    ok "export-range latest-per-index: created ${FILE_COUNT} files (expected 3 unique indices)"
+else
+    fail "export-range latest-per-index: created ${FILE_COUNT} files (expected 3)"
+fi
+if [ "$TOTAL_LINES" = "6" ]; then
+    ok "export-range latest-per-index: exported ${TOTAL_LINES} docs (expected 6)"
+else
+    fail "export-range latest-per-index: exported ${TOTAL_LINES} docs (expected 6)"
+fi
+
+if find "$RANGE_EXPORT_DIR" -name "*${RANGE_INDEX_TWO}*.jsonl" | grep -q .; then
+    ok "export-range latest-per-index: exported files named by index"
+else
+    fail "export-range latest-per-index: missing output for ${RANGE_INDEX_TWO}"
+fi
+
+# ── Export Test 11: export-range --all-snapshots ─────────────────────────────
+
+RANGE_EXPORT_ALL_DIR="$EXPORT_DIR/export-range-all"
+mkdir -p "$RANGE_EXPORT_ALL_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: export-range --all-snapshots" >&2
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index-pattern '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_ALL_DIR" \
+    --all-snapshots 2>/dev/null || true
+
+FILE_COUNT=$(find "$RANGE_EXPORT_ALL_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
+TOTAL_LINES=$(find "$RANGE_EXPORT_ALL_DIR" -name '*.jsonl' -exec cat {} \; | wc -l | tr -d ' ')
+if [ "$FILE_COUNT" = "4" ]; then
+    ok "export-range --all-snapshots: created ${FILE_COUNT} files (expected 4 snapshot/index pairs)"
+else
+    fail "export-range --all-snapshots: created ${FILE_COUNT} files (expected 4)"
+fi
+if [ "$TOTAL_LINES" = "8" ]; then
+    ok "export-range --all-snapshots: exported ${TOTAL_LINES} docs (expected 8)"
+else
+    fail "export-range --all-snapshots: exported ${TOTAL_LINES} docs (expected 8)"
 fi
 
 # ── Results ──────────────────────────────────────────────────────────────────
