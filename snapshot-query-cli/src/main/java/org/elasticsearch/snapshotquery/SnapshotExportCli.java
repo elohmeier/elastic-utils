@@ -43,14 +43,7 @@ import java.util.Set;
 
 public class SnapshotExportCli extends Command {
 
-    private final OptionSpec<String> bucketOption;
-    private final OptionSpec<String> basePathOption;
-    private final OptionSpec<String> regionOption;
-    private final OptionSpec<String> endpointOption;
-    private final OptionSpec<String> accessKeyOption;
-    private final OptionSpec<String> secretKeyOption;
-    private final OptionSpec<Void> trustAllCertsOption;
-    private final OptionSpec<String> resolveOption;
+    private final S3Options s3Options;
     private final OptionSpec<String> snapshotOption;
     private final OptionSpec<String> indexOption;
     private final OptionSpec<String> queryFileOption;
@@ -63,14 +56,7 @@ public class SnapshotExportCli extends Command {
 
     public SnapshotExportCli() {
         super("Export documents from Elasticsearch snapshots in S3 to JSONL");
-        bucketOption = parser.acceptsAll(Arrays.asList("b", "bucket"), "S3 bucket name").withRequiredArg().required();
-        basePathOption = parser.accepts("base-path", "Base path within the S3 bucket").withRequiredArg().defaultsTo("");
-        regionOption = parser.accepts("region", "AWS region").withRequiredArg().defaultsTo("us-east-1");
-        endpointOption = parser.accepts("endpoint", "Custom S3 endpoint URL").withRequiredArg();
-        accessKeyOption = parser.accepts("access-key", "AWS access key").withRequiredArg();
-        secretKeyOption = parser.accepts("secret-key", "AWS secret key").withRequiredArg();
-        trustAllCertsOption = parser.accepts("trust-all-certs", "Disable TLS certificate verification");
-        resolveOption = parser.accepts("resolve", "Resolve hostname to IP (hostname:ip)").withRequiredArg();
+        s3Options = new S3Options(parser);
         snapshotOption = parser.acceptsAll(Arrays.asList("s", "snapshot"), "Snapshot name (auto-detected if omitted)").withRequiredArg();
         indexOption = parser.acceptsAll(Arrays.asList("i", "index"), "Index name, alias, or pattern").withRequiredArg().required();
         queryFileOption = parser.accepts("query-file", "Path to JSON file containing search body or Query DSL").withRequiredArg();
@@ -86,14 +72,6 @@ public class SnapshotExportCli extends Command {
     protected void execute(Terminal terminal, OptionSet options, ProcessInfo processInfo) throws Exception {
         long startTime = System.currentTimeMillis();
 
-        String bucket = bucketOption.value(options);
-        String basePath = basePathOption.value(options);
-        String region = regionOption.value(options);
-        String endpoint = options.has(endpointOption) ? endpointOption.value(options) : null;
-        String accessKey = options.has(accessKeyOption) ? accessKeyOption.value(options) : null;
-        String secretKey = options.has(secretKeyOption) ? secretKeyOption.value(options) : null;
-        boolean trustAllCerts = options.has(trustAllCertsOption);
-        String resolve = options.has(resolveOption) ? resolveOption.value(options) : null;
         String snapshotName = options.has(snapshotOption) ? snapshotOption.value(options) : null;
         String indexNameOrAlias = indexOption.value(options);
         String fromDate = options.has(fromDateOption) ? fromDateOption.value(options) : null;
@@ -108,10 +86,10 @@ public class SnapshotExportCli extends Command {
         Sort sort = searchBody.sort();
         List<String> sourceFields = searchBody.sourceFields();
 
-        terminal.errorPrintln("Connecting to S3 bucket: " + bucket);
+        terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
 
         try (
-            S3ClientFactory.S3Access s3Access = S3ClientFactory.create(bucket, basePath, region, endpoint, accessKey, secretKey, trustAllCerts, resolve);
+            S3ClientFactory.S3Access s3Access = s3Options.connect(options);
             OutputStream out = openOutput(outputPath, compression)
         ) {
             BlobContainer rootContainer = s3Access.rootContainer();

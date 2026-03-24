@@ -30,60 +30,38 @@ import java.util.List;
 
 public class SnapshotQueryCli extends Command {
 
-    private final OptionSpec<String> bucketOption;
-    private final OptionSpec<String> basePathOption;
-    private final OptionSpec<String> regionOption;
-    private final OptionSpec<String> endpointOption;
-    private final OptionSpec<String> accessKeyOption;
-    private final OptionSpec<String> secretKeyOption;
+    private final S3Options s3Options;
     private final OptionSpec<String> snapshotOption;
     private final OptionSpec<String> indexOption;
     private final OptionSpec<String> queryFileOption;
     private final OptionSpec<String> queryOption;
     private final OptionSpec<Integer> sizeOption;
-    private final OptionSpec<Void> trustAllCertsOption;
-    private final OptionSpec<String> resolveOption;
 
     public SnapshotQueryCli() {
         super("Query Elasticsearch snapshot data in S3 without a running cluster");
-        bucketOption = parser.acceptsAll(Arrays.asList("b", "bucket"), "S3 bucket name").withRequiredArg().required();
-        basePathOption = parser.accepts("base-path", "Base path within the S3 bucket").withRequiredArg().defaultsTo("");
-        regionOption = parser.accepts("region", "AWS region").withRequiredArg().defaultsTo("us-east-1");
-        endpointOption = parser.accepts("endpoint", "Custom S3 endpoint URL (for S3-compatible stores)").withRequiredArg();
-        accessKeyOption = parser.accepts("access-key", "AWS access key (falls back to env/profile)").withRequiredArg();
-        secretKeyOption = parser.accepts("secret-key", "AWS secret key (falls back to env/profile)").withRequiredArg();
+        s3Options = new S3Options(parser);
         snapshotOption = parser.acceptsAll(Arrays.asList("s", "snapshot"), "Snapshot name").withRequiredArg().required();
         indexOption = parser.acceptsAll(Arrays.asList("i", "index"), "Index name").withRequiredArg().required();
         queryFileOption = parser.accepts("query-file", "Path to JSON file containing Query DSL").withRequiredArg();
         queryOption = parser.acceptsAll(Arrays.asList("q", "query"), "Inline Query DSL JSON").withRequiredArg();
         sizeOption = parser.accepts("size", "Maximum number of results").withRequiredArg().ofType(Integer.class).defaultsTo(10);
-        trustAllCertsOption = parser.accepts("trust-all-certs", "Disable TLS certificate verification (insecure)");
-        resolveOption = parser.accepts("resolve", "Resolve hostname to IP (format: hostname:ip, e.g. s3.example.com:127.0.0.1)").withRequiredArg();
     }
 
     @Override
     protected void execute(Terminal terminal, OptionSet options, ProcessInfo processInfo) throws Exception {
         long startTime = System.currentTimeMillis();
 
-        String bucket = bucketOption.value(options);
-        String basePath = basePathOption.value(options);
-        String region = regionOption.value(options);
-        String endpoint = options.has(endpointOption) ? endpointOption.value(options) : null;
-        String accessKey = options.has(accessKeyOption) ? accessKeyOption.value(options) : null;
-        String secretKey = options.has(secretKeyOption) ? secretKeyOption.value(options) : null;
-        boolean trustAllCerts = options.has(trustAllCertsOption);
-        String resolve = options.has(resolveOption) ? resolveOption.value(options) : null;
         String snapshotName = snapshotOption.value(options);
         String indexName = indexOption.value(options);
         int size = sizeOption.value(options);
 
         String queryJson = resolveQuery(options);
 
-        terminal.errorPrintln("Connecting to S3 bucket: " + bucket);
+        terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
         terminal.errorPrintln("Snapshot: " + snapshotName + ", Index: " + indexName);
 
         // Step 1: Create S3 blob store
-        try (S3ClientFactory.S3Access s3Access = S3ClientFactory.create(bucket, basePath, region, endpoint, accessKey, secretKey, trustAllCerts, resolve)) {
+        try (S3ClientFactory.S3Access s3Access = s3Options.connect(options)) {
             BlobContainer rootContainer = s3Access.rootContainer();
 
             // Step 2: Load snapshot metadata
