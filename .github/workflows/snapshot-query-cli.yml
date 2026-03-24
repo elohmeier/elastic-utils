@@ -79,7 +79,7 @@ jobs:
 
       - name: Build release JAR
         if: steps.semantic.outputs.released == 'true'
-        run: ./gradlew shadowJar -Pversion=${{ steps.semantic.outputs.version }}
+        run: ./gradlew shadowJar -PcliVersion=${{ steps.semantic.outputs.version }}
 
       - name: Attach JAR to GitHub release
         if: steps.semantic.outputs.released == 'true'
