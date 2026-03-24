@@ -160,6 +160,7 @@ public class SnapshotMetadataLoader {
         // Check if it's an alias or wildcard pattern
         boolean isWildcard = indexNameOrAlias.contains("*");
 
+        int skipped = 0;
         for (var entry : snapshotIndices.entrySet()) {
             String concreteIndexName = entry.getKey();
             IndexId indexId = entry.getValue();
@@ -171,20 +172,32 @@ public class SnapshotMetadataLoader {
 
             if (!matches) {
                 // Check aliases: load index metadata and check getAliases()
-                String metaBlobId = repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
-                BlobContainer idxContainer = indexContainer(indexId);
-                IndexMetadata indexMetadata = BlobStoreRepository.INDEX_METADATA_FORMAT.read(
-                    null, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY
-                );
+                try {
+                    String metaBlobId = repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
+                    BlobContainer idxContainer = indexContainer(indexId);
+                    IndexMetadata indexMetadata = BlobStoreRepository.INDEX_METADATA_FORMAT.read(
+                        null, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY
+                    );
 
-                if (indexMetadata.getAliases().containsKey(indexNameOrAlias)) {
-                    matches = true;
+                    if (indexMetadata.getAliases().containsKey(indexNameOrAlias)) {
+                        matches = true;
+                    }
+                } catch (Exception e) {
+                    skipped++;
+                    continue;
                 }
             }
 
             if (matches) {
-                results.add(resolveWithId(repositoryData, snapshotId, indexId));
+                try {
+                    results.add(resolveWithId(repositoryData, snapshotId, indexId));
+                } catch (Exception e) {
+                    System.err.println("WARN: Skipping index [" + concreteIndexName + "]: " + e.getMessage());
+                }
             }
+        }
+        if (skipped > 0) {
+            System.err.println("WARN: Skipped " + skipped + " indices with missing metadata");
         }
 
         if (results.isEmpty()) {
