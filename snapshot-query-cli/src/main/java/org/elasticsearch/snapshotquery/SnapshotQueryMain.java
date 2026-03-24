@@ -6,6 +6,7 @@ import org.elasticsearch.cli.Terminal;
 import org.elasticsearch.logging.Level;
 import org.elasticsearch.logging.Logger;
 import org.elasticsearch.logging.internal.spi.LoggerFactory;
+import org.apache.logging.log4j.status.StatusLogger;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
@@ -60,5 +61,10 @@ public class SnapshotQueryMain extends MultiCommand {
         System.setProperty("org.apache.logging.log4j.simplelog.showlogname", "false");
         System.setProperty("org.apache.logging.log4j.simplelog.showShortLogname", "true");
         System.setProperty("org.apache.logging.log4j.simplelog.level", "ERROR");
+        System.setProperty("log4j2.statusLoggerLevel", "OFF");
+
+        StatusLogger statusLogger = StatusLogger.getLogger();
+        statusLogger.reset();
+        statusLogger.setLevel(org.apache.logging.log4j.Level.OFF);
     }
 }
