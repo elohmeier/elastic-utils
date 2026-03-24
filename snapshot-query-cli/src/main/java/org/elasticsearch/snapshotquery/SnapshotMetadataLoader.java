@@ -1,6 +1,7 @@
 package org.elasticsearch.snapshotquery;
 
 import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.common.Numbers;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.BlobPath;
@@ -13,6 +14,7 @@ import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.snapshots.SnapshotInfo;
+import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
 import org.elasticsearch.xcontent.XContentParser;
@@ -27,6 +29,8 @@ import java.util.List;
  * Loads snapshot metadata from S3 without requiring a running Elasticsearch cluster.
  */
 public class SnapshotMetadataLoader {
+
+    private static final ProjectRepo DUMMY_REPO = new ProjectRepo(ProjectId.DEFAULT, "_");
 
     private final BlobContainer rootContainer;
     private final S3ClientFactory.S3Access s3Access;
@@ -66,7 +70,7 @@ public class SnapshotMetadataLoader {
         String metaBlobId = repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
         BlobContainer indexContainer = indexContainer(indexId);
         IndexMetadata indexMetadata = BlobStoreRepository.INDEX_METADATA_FORMAT.read(
-            null, indexContainer, metaBlobId, NamedXContentRegistry.EMPTY
+            DUMMY_REPO, indexContainer, metaBlobId, NamedXContentRegistry.EMPTY
         );
 
         int shardCount = indexMetadata.getNumberOfShards();
@@ -76,7 +80,7 @@ public class SnapshotMetadataLoader {
         for (int shard = 0; shard < shardCount; shard++) {
             BlobContainer shardCont = shardContainer(indexId, shard);
             BlobStoreIndexShardSnapshot shardSnapshot = BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.read(
-                null, shardCont, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+                DUMMY_REPO, shardCont, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
             );
             shardSnapshots.add(new ShardSnapshot(shard, shardSnapshot));
         }
@@ -220,7 +224,7 @@ public class SnapshotMetadataLoader {
         for (int shard = 0; shard < shardCount; shard++) {
             BlobContainer shardCont = shardContainer(indexId, shard);
             BlobStoreIndexShardSnapshot shardSnapshot = BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.read(
-                null, shardCont, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+                DUMMY_REPO, shardCont, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
             );
             shardSnapshots.add(new ShardSnapshot(shard, shardSnapshot));
         }
@@ -244,7 +248,7 @@ public class SnapshotMetadataLoader {
             SnapshotInfo info;
             try {
                 info = BlobStoreRepository.SNAPSHOT_FORMAT.read(
-                    "_", rootContainer, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+                    DUMMY_REPO, rootContainer, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
                 );
             } catch (Exception e) {
                 // Skip snapshots whose info can't be loaded
@@ -316,7 +320,7 @@ public class SnapshotMetadataLoader {
             if (found) {
                 try {
                     SnapshotInfo info = BlobStoreRepository.SNAPSHOT_FORMAT.read(
-                        "_", rootContainer, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+                        DUMMY_REPO, rootContainer, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
                     );
                     matching.add(new SnapshotSummary(
                         snapshotId, info.state().toString(), info.startTime(), info.endTime(), info.indices()

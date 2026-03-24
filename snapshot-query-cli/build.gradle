@@ -13,9 +13,9 @@ java {
 }
 
 ext {
-    esVersion = '9.0.3'
+    esVersion = '9.3.1'
     awsSdkVersion = '2.31.78'
-    luceneVersion = '10.1.0'  // ES 9.0.x bundles Lucene 10.1.0
+    luceneVersion = '10.3.2'  // ES 9.3.x bundles Lucene 10.3.2
 }
 
 repositories {
