@@ -71,7 +71,7 @@ public class SnapshotExportCli extends Command {
         secretKeyOption = parser.accepts("secret-key", "AWS secret key").withRequiredArg();
         trustAllCertsOption = parser.accepts("trust-all-certs", "Disable TLS certificate verification");
         resolveOption = parser.accepts("resolve", "Resolve hostname to IP (hostname:ip)").withRequiredArg();
-        snapshotOption = parser.acceptsAll(Arrays.asList("s", "snapshot"), "Snapshot name").withRequiredArg().required();
+        snapshotOption = parser.acceptsAll(Arrays.asList("s", "snapshot"), "Snapshot name (auto-detected if omitted)").withRequiredArg();
         indexOption = parser.acceptsAll(Arrays.asList("i", "index"), "Index name, alias, or pattern").withRequiredArg().required();
         queryFileOption = parser.accepts("query-file", "Path to JSON file containing search body or Query DSL").withRequiredArg();
         queryOption = parser.acceptsAll(Arrays.asList("q", "query"), "Inline Query DSL JSON").withRequiredArg();
@@ -94,7 +94,7 @@ public class SnapshotExportCli extends Command {
         String secretKey = options.has(secretKeyOption) ? secretKeyOption.value(options) : null;
         boolean trustAllCerts = options.has(trustAllCertsOption);
         String resolve = options.has(resolveOption) ? resolveOption.value(options) : null;
-        String snapshotName = snapshotOption.value(options);
+        String snapshotName = options.has(snapshotOption) ? snapshotOption.value(options) : null;
         String indexNameOrAlias = indexOption.value(options);
         String fromDate = options.has(fromDateOption) ? fromDateOption.value(options) : null;
         String toDate = options.has(toDateOption) ? toDateOption.value(options) : null;
@@ -109,10 +109,6 @@ public class SnapshotExportCli extends Command {
         List<String> sourceFields = searchBody.sourceFields();
 
         terminal.errorPrintln("Connecting to S3 bucket: " + bucket);
-        terminal.errorPrintln("Snapshot: " + snapshotName + ", Index: " + indexNameOrAlias);
-        if (fromDate != null || toDate != null) {
-            terminal.errorPrintln("Date range: " + (fromDate != null ? fromDate : "*") + " to " + (toDate != null ? toDate : "*"));
-        }
 
         try (
             S3ClientFactory.S3Access s3Access = S3ClientFactory.create(bucket, basePath, region, endpoint, accessKey, secretKey, trustAllCerts, resolve);
@@ -120,6 +116,26 @@ public class SnapshotExportCli extends Command {
         ) {
             BlobContainer rootContainer = s3Access.rootContainer();
             SnapshotMetadataLoader metadataLoader = new SnapshotMetadataLoader(rootContainer, s3Access);
+
+            // Auto-discover snapshot if not specified
+            if (snapshotName == null) {
+                terminal.errorPrintln("No snapshot specified, searching for snapshots containing [" + indexNameOrAlias + "]...");
+                java.util.List<String> candidates = metadataLoader.findSnapshotsForIndex(indexNameOrAlias);
+                if (candidates.isEmpty()) {
+                    throw new UserException(ExitCodes.CONFIG, "No snapshots found containing index/alias [" + indexNameOrAlias + "]");
+                }
+                snapshotName = candidates.get(0); // newest first
+                terminal.errorPrintln("Auto-selected snapshot: " + snapshotName);
+                if (candidates.size() > 1) {
+                    terminal.errorPrintln("  (other candidates: " + String.join(", ", candidates.subList(1, Math.min(5, candidates.size())))
+                        + (candidates.size() > 5 ? " ..." : "") + ")");
+                }
+            }
+
+            terminal.errorPrintln("Snapshot: " + snapshotName + ", Index: " + indexNameOrAlias);
+            if (fromDate != null || toDate != null) {
+                terminal.errorPrintln("Date range: " + (fromDate != null ? fromDate : "*") + " to " + (toDate != null ? toDate : "*"));
+            }
 
             // Resolve index (supports aliases and patterns)
             terminal.errorPrintln("Resolving indices...");

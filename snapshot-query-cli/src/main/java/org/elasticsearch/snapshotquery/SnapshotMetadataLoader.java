@@ -12,6 +12,7 @@ import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.snapshots.SnapshotId;
+import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
 import org.elasticsearch.xcontent.XContentParser;
@@ -219,7 +220,109 @@ public class SnapshotMetadataLoader {
         return text.matches(regex);
     }
 
+    /**
+     * Lists all snapshots in the repository with their metadata.
+     */
+    public List<SnapshotSummary> listSnapshots() throws IOException {
+        RepositoryData repositoryData = loadRepositoryData();
+        List<SnapshotSummary> summaries = new ArrayList<>();
+
+        for (SnapshotId snapshotId : repositoryData.getSnapshotIds()) {
+            SnapshotInfo info;
+            try {
+                info = BlobStoreRepository.SNAPSHOT_FORMAT.read(
+                    "_", rootContainer, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+                );
+            } catch (Exception e) {
+                // Skip snapshots whose info can't be loaded
+                continue;
+            }
+
+            List<String> indices = info.indices();
+            summaries.add(new SnapshotSummary(
+                snapshotId,
+                info.state().toString(),
+                info.startTime(),
+                info.endTime(),
+                indices
+            ));
+        }
+
+        // Sort by start time
+        summaries.sort((a, b) -> Long.compare(a.startTimeMillis(), b.startTimeMillis()));
+        return summaries;
+    }
+
+    /**
+     * Find snapshots that contain the given index name or alias.
+     * Returns snapshot names sorted by start time (newest first).
+     */
+    public List<String> findSnapshotsForIndex(String indexNameOrAlias) throws IOException {
+        RepositoryData repositoryData = loadRepositoryData();
+        var allIndices = repositoryData.getIndices();
+        List<SnapshotSummary> matching = new ArrayList<>();
+
+        // Check if it's a direct index name
+        IndexId directMatch = allIndices.get(indexNameOrAlias);
+
+        for (SnapshotId snapshotId : repositoryData.getSnapshotIds()) {
+            boolean found = false;
+
+            if (directMatch != null) {
+                // Check if this snapshot contains the index
+                var snapshotIndexIds = repositoryData.getIndices();
+                // RepositoryData.getIndices() gives all indices across all snapshots,
+                // so check via indexSnapshots
+                List<SnapshotId> snapshots = repositoryData.getSnapshots(directMatch);
+                found = snapshots.contains(snapshotId);
+            }
+
+            if (!found) {
+                // Check aliases: need to look at each index's metadata in this snapshot
+                for (var entry : allIndices.entrySet()) {
+                    IndexId indexId = entry.getValue();
+                    List<SnapshotId> snapshots = repositoryData.getSnapshots(indexId);
+                    if (!snapshots.contains(snapshotId)) continue;
+
+                    try {
+                        String metaBlobId = repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
+                        BlobContainer idxContainer = indexContainer(indexId);
+                        IndexMetadata indexMetadata = BlobStoreRepository.INDEX_METADATA_FORMAT.read(
+                            null, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY
+                        );
+                        if (indexMetadata.getAliases().containsKey(indexNameOrAlias)) {
+                            found = true;
+                            break;
+                        }
+                    } catch (Exception e) {
+                        // skip unreadable metadata
+                    }
+                }
+            }
+
+            if (found) {
+                try {
+                    SnapshotInfo info = BlobStoreRepository.SNAPSHOT_FORMAT.read(
+                        "_", rootContainer, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+                    );
+                    matching.add(new SnapshotSummary(
+                        snapshotId, info.state().toString(), info.startTime(), info.endTime(), info.indices()
+                    ));
+                } catch (Exception e) {
+                    // include without time info
+                    matching.add(new SnapshotSummary(snapshotId, "UNKNOWN", 0, 0, List.of()));
+                }
+            }
+        }
+
+        // Sort newest first
+        matching.sort((a, b) -> Long.compare(b.startTimeMillis(), a.startTimeMillis()));
+        return matching.stream().map(s -> s.snapshotId().getName()).toList();
+    }
+
     public record ShardSnapshot(int shardId, BlobStoreIndexShardSnapshot snapshot) {}
 
     public record ResolvedIndex(SnapshotId snapshotId, IndexId indexId, IndexMetadata indexMetadata, List<ShardSnapshot> shardSnapshots) {}
+
+    public record SnapshotSummary(SnapshotId snapshotId, String state, long startTimeMillis, long endTimeMillis, List<String> indices) {}
 }

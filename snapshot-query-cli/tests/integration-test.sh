@@ -100,7 +100,7 @@ done
 # ── Step 1: Build the standalone JAR ─────────────────────────────────────────
 
 if [ -z "$JAR_PATH" ]; then
-    JAR_PATH="$PROJECT_ROOT/build/libs/elasticsearch-snapshot-query-cli-1.0.0.jar"
+    JAR_PATH=$(ls -1 "$PROJECT_ROOT"/build/libs/elasticsearch-snapshot-query-cli-*.jar 2>/dev/null | head -1)
 fi
 
 if [ "$SKIP_BUILD" = false ]; then
@@ -644,6 +644,108 @@ if [ -f "$OUTFILE" ]; then
     fi
 else
     fail "full body export: output file not created"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# List-snapshots and auto-discovery tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+log ""
+log "============================================"
+log "  Running snapshots & auto-discovery tests"
+log "============================================"
+log ""
+
+S3_COMMON_ARGS=(
+    --bucket "$MINIO_BUCKET"
+    --endpoint "$MINIO_ENDPOINT"
+    --region us-east-1
+    --access-key "$MINIO_ROOT_USER"
+    --secret-key "$MINIO_ROOT_PASSWORD"
+)
+
+# ── List-snapshots Test 1: list all snapshots ─────────────────────────────────
+
+echo -e "\033[1;34m==>\033[0m Test: snapshots (all)" >&2
+LIST_OUTPUT=$("$JAVA" -jar "$JAR_PATH" snapshots "${S3_COMMON_ARGS[@]}" 2>/dev/null) || true
+
+if echo "$LIST_OUTPUT" | grep -q "$SNAPSHOT_NAME"; then
+    ok "snapshots: found snapshot [${SNAPSHOT_NAME}]"
+else
+    fail "snapshots: snapshot [${SNAPSHOT_NAME}] not in output"
+    echo "    Output: $LIST_OUTPUT"
+fi
+
+if echo "$LIST_OUTPUT" | grep -q "SUCCESS"; then
+    ok "snapshots: shows SUCCESS state"
+else
+    fail "snapshots: missing SUCCESS state"
+fi
+
+# ── List-snapshots Test 2: filter by index name ──────────────────────────────
+
+echo -e "\033[1;34m==>\033[0m Test: snapshots --index (by name)" >&2
+LIST_OUTPUT=$("$JAVA" -jar "$JAR_PATH" snapshots "${S3_COMMON_ARGS[@]}" --index "$INDEX_NAME" 2>/dev/null) || true
+
+if echo "$LIST_OUTPUT" | grep -q "$SNAPSHOT_NAME"; then
+    ok "snapshots --index: found snapshot for index [${INDEX_NAME}]"
+else
+    fail "snapshots --index: snapshot not found for index [${INDEX_NAME}]"
+    echo "    Output: $LIST_OUTPUT"
+fi
+
+# ── List-snapshots Test 3: filter by alias ────────────────────────────────────
+
+echo -e "\033[1;34m==>\033[0m Test: snapshots --index (by alias)" >&2
+LIST_OUTPUT=$("$JAVA" -jar "$JAR_PATH" snapshots "${S3_COMMON_ARGS[@]}" --index "$ALIAS_NAME" 2>/dev/null) || true
+
+if echo "$LIST_OUTPUT" | grep -q "$SNAPSHOT_NAME"; then
+    ok "snapshots --index (alias): found snapshot for alias [${ALIAS_NAME}]"
+else
+    fail "snapshots --index (alias): snapshot not found for alias [${ALIAS_NAME}]"
+    echo "    Output: $LIST_OUTPUT"
+fi
+
+# ── Export Test 8: auto-discover snapshot ─────────────────────────────────────
+
+OUTFILE="$EXPORT_DIR/auto-discover-export.jsonl"
+echo -e "\033[1;34m==>\033[0m Export test: auto-discover snapshot (no --snapshot)" >&2
+"$JAVA" -jar "$JAR_PATH" export \
+    "${S3_COMMON_ARGS[@]}" \
+    --index "$INDEX_NAME" \
+    --query '{"match_all":{}}' \
+    -o "$OUTFILE" 2>/dev/null || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    if [ "$LINE_COUNT" = "10" ]; then
+        ok "auto-discover export: got ${LINE_COUNT} lines without --snapshot (expected 10)"
+    else
+        fail "auto-discover export: got ${LINE_COUNT} lines (expected 10)"
+    fi
+else
+    fail "auto-discover export: output file not created"
+fi
+
+# ── Export Test 9: auto-discover via alias ────────────────────────────────────
+
+OUTFILE="$EXPORT_DIR/auto-discover-alias-export.jsonl"
+echo -e "\033[1;34m==>\033[0m Export test: auto-discover snapshot via alias" >&2
+"$JAVA" -jar "$JAR_PATH" export \
+    "${S3_COMMON_ARGS[@]}" \
+    --index "$ALIAS_NAME" \
+    --query '{"match_all":{}}' \
+    -o "$OUTFILE" 2>/dev/null || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    if [ "$LINE_COUNT" = "10" ]; then
+        ok "auto-discover alias export: got ${LINE_COUNT} lines (expected 10)"
+    else
+        fail "auto-discover alias export: got ${LINE_COUNT} lines (expected 10)"
+    fi
+else
+    fail "auto-discover alias export: output file not created"
 fi
 
 # ── Results ──────────────────────────────────────────────────────────────────
