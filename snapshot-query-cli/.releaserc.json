@@ -14,15 +14,7 @@
     [
       "@semantic-release/exec",
       {
-        "prepareCmd": "sed -i \"s/^version = .*/version = '${nextRelease.version}'/\" build.gradle",
         "successCmd": "echo \"released=true\" >> $GITHUB_OUTPUT && echo \"version=${nextRelease.version}\" >> $GITHUB_OUTPUT"
-      }
-    ],
-    [
-      "@semantic-release/git",
-      {
-        "assets": ["snapshot-query-cli/build.gradle"],
-        "message": "chore(release): snapshot-query-cli ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
       }
     ],
     "@semantic-release/github"

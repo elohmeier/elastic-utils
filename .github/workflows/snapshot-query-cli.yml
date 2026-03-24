@@ -72,7 +72,6 @@ jobs:
           npx --yes
           -p semantic-release@25
           -p @semantic-release/exec@7
-          -p @semantic-release/git@10
           -p @semantic-release/github@12
           -p @semantic-release/commit-analyzer@13
           -p @semantic-release/release-notes-generator@14
@@ -80,11 +79,11 @@ jobs:
 
       - name: Build release JAR
         if: steps.semantic.outputs.released == 'true'
-        run: ./gradlew shadowJar
+        run: ./gradlew shadowJar -Pversion=${{ steps.semantic.outputs.version }}
 
       - name: Attach JAR to GitHub release
         if: steps.semantic.outputs.released == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: snapshot-query-cli-v${{ steps.semantic.outputs.version }}
-          files: snapshot-query-cli/build/libs/elasticsearch-snapshot-query-cli-*.jar
+          files: snapshot-query-cli/build/libs/elasticsearch-snapshot-query-cli-${{ steps.semantic.outputs.version }}.jar
