@@ -28,10 +28,26 @@ public class SnapshotQueryDirectory extends BaseDirectory {
 
     private final BlobContainer blobContainer;
     private final Map<String, FileInfo> fileInfoMap;
+    private final ProfilingRecorder profilingRecorder;
+    private final String indexName;
+    private final int shardId;
 
     public SnapshotQueryDirectory(BlobContainer blobContainer, BlobStoreIndexShardSnapshot shardSnapshot) {
+        this(blobContainer, shardSnapshot, null, null, -1);
+    }
+
+    public SnapshotQueryDirectory(
+        BlobContainer blobContainer,
+        BlobStoreIndexShardSnapshot shardSnapshot,
+        ProfilingRecorder profilingRecorder,
+        String indexName,
+        int shardId
+    ) {
         super(NoLockFactory.INSTANCE);
         this.blobContainer = blobContainer;
+        this.profilingRecorder = profilingRecorder;
+        this.indexName = indexName;
+        this.shardId = shardId;
         this.fileInfoMap = new HashMap<>();
         for (FileInfo fileInfo : shardSnapshot.indexFiles()) {
             fileInfoMap.put(fileInfo.physicalName(), fileInfo);
@@ -72,7 +88,7 @@ public class SnapshotQueryDirectory extends BaseDirectory {
             return new ByteArrayIndexInput(name, data);
         }
 
-        return new S3IndexInput(name, blobContainer, fileInfo);
+        return new S3IndexInput(name, blobContainer, fileInfo, profilingRecorder, indexName, shardId, 0, fileInfo.length(), BufferedIndexInput.BUFFER_SIZE);
     }
 
     @Override
@@ -126,15 +142,31 @@ public class SnapshotQueryDirectory extends BaseDirectory {
         private final FileInfo fileInfo;
         private final long offset;
         private final long length;
+        private final ProfilingRecorder profilingRecorder;
+        private final String indexName;
+        private final int shardId;
 
         S3IndexInput(String name, BlobContainer blobContainer, FileInfo fileInfo) {
-            this(name, blobContainer, fileInfo, 0, fileInfo.length(), BufferedIndexInput.BUFFER_SIZE);
+            this(name, blobContainer, fileInfo, null, null, -1, 0, fileInfo.length(), BufferedIndexInput.BUFFER_SIZE);
         }
 
-        private S3IndexInput(String name, BlobContainer blobContainer, FileInfo fileInfo, long offset, long length, int bufferSize) {
+        private S3IndexInput(
+            String name,
+            BlobContainer blobContainer,
+            FileInfo fileInfo,
+            ProfilingRecorder profilingRecorder,
+            String indexName,
+            int shardId,
+            long offset,
+            long length,
+            int bufferSize
+        ) {
             super("S3IndexInput(" + name + ")", bufferSize);
             this.blobContainer = blobContainer;
             this.fileInfo = fileInfo;
+            this.profilingRecorder = profilingRecorder;
+            this.indexName = indexName;
+            this.shardId = shardId;
             this.offset = offset;
             this.length = length;
         }
@@ -157,11 +189,15 @@ public class SnapshotQueryDirectory extends BaseDirectory {
                 int toRead = (int) Math.min(remaining, partLen - posInPart);
 
                 String blobName = fileInfo.partName(part);
+                long readStartNanos = System.nanoTime();
                 try (InputStream is = blobContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, blobName, posInPart, toRead)) {
                     byte[] buf = is.readNBytes(toRead);
                     b.put(buf);
                     remaining -= buf.length;
                     pos += buf.length;
+                    if (profilingRecorder != null && indexName != null) {
+                        profilingRecorder.recordLuceneFileRead(indexName, shardId, fileInfo.physicalName(), buf.length, System.nanoTime() - readStartNanos);
+                    }
                     if (buf.length < toRead) {
                         throw new EOFException("Short read from S3: expected " + toRead + " bytes but got " + buf.length);
                     }
@@ -189,7 +225,17 @@ public class SnapshotQueryDirectory extends BaseDirectory {
                     "slice(offset=" + sliceOffset + ", length=" + sliceLength + ") out of bounds for length=" + length
                 );
             }
-            return new S3IndexInput(sliceDescription, blobContainer, fileInfo, offset + sliceOffset, sliceLength, BUFFER_SIZE);
+            return new S3IndexInput(
+                sliceDescription,
+                blobContainer,
+                fileInfo,
+                profilingRecorder,
+                indexName,
+                shardId,
+                offset + sliceOffset,
+                sliceLength,
+                BUFFER_SIZE
+            );
         }
 
         @Override

@@ -4,6 +4,8 @@ import joptsimple.OptionParser;
 import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 
+import org.elasticsearch.core.Nullable;
+
 import java.util.Arrays;
 
 /**
@@ -38,6 +40,10 @@ public class S3Options {
     }
 
     public S3ClientFactory.S3Access connect(OptionSet options) {
+        return connect(options, null);
+    }
+
+    public S3ClientFactory.S3Access connect(OptionSet options, @Nullable ProfilingRecorder profilingRecorder) {
         String bucketVal = resolve(options, bucket, "S3_BUCKET", null);
         if (bucketVal == null || bucketVal.isEmpty()) {
             throw new IllegalArgumentException("--bucket or S3_BUCKET is required");
@@ -50,7 +56,7 @@ public class S3Options {
         boolean trustAll = options.has(trustAllCerts) || "1".equals(env("S3_TRUST_ALL_CERTS")) || "true".equalsIgnoreCase(env("S3_TRUST_ALL_CERTS"));
         String resolveVal = resolve(options, this.resolve, "S3_RESOLVE", null);
 
-        return S3ClientFactory.create(bucketVal, basePathVal, regionVal, endpointVal, accessKeyVal, secretKeyVal, trustAll, resolveVal);
+        return S3ClientFactory.create(bucketVal, basePathVal, regionVal, endpointVal, accessKeyVal, secretKeyVal, trustAll, resolveVal, profilingRecorder);
     }
 
     public String bucket(OptionSet options) {

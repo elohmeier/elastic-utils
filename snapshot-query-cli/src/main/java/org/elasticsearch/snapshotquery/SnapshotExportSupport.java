@@ -45,7 +45,8 @@ final class SnapshotExportSupport {
         List<String> sourceFields,
         int batchSize,
         OutputStream out,
-        long startTimeMillis
+        long startTimeMillis,
+        ProfilingRecorder profilingRecorder
     ) throws IOException {
         String indexName = resolved.indexId().getName();
         int shardCount = resolved.shardSnapshots().size();
@@ -57,20 +58,30 @@ final class SnapshotExportSupport {
             BlobContainer shardContainer = metadataLoader.shardContainer(resolved.indexId(), shardId);
             BlobStoreIndexShardSnapshot blobStoreSnapshot = shardSnapshot.snapshot();
 
+            long openStartNanos = System.nanoTime();
             try (
-                Directory directory = new SnapshotQueryDirectory(shardContainer, blobStoreSnapshot);
+                Directory directory = new SnapshotQueryDirectory(shardContainer, blobStoreSnapshot, profilingRecorder, indexName, shardId);
                 DirectoryReader reader = DirectoryReader.open(directory)
             ) {
+                long openNanos = System.nanoTime() - openStartNanos;
+                if (profilingRecorder != null) {
+                    profilingRecorder.recordShardOpen(indexName, shardId, openNanos);
+                }
                 IndexSearcher searcher = new IndexSearcher(reader);
-                long shardStart = System.currentTimeMillis();
+                long shardStartNanos = System.nanoTime();
                 long shardExported = exportShard(searcher, luceneQuery, sort, sourceFields, batchSize, out);
-                long shardTookMs = System.currentTimeMillis() - shardStart;
+                long shardSearchNanos = System.nanoTime() - shardStartNanos;
+                long shardTookMs = shardSearchNanos / 1_000_000L;
                 totalExported += shardExported;
+                if (profilingRecorder != null) {
+                    profilingRecorder.recordShardSearch(indexName, shardId, shardExported, shardSearchNanos);
+                }
 
                 long elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000;
                 terminal.errorPrintln(
                     "  Shard " + shardId + ": exported " + shardExported
-                        + " docs (index total: " + totalExported + ", shard: " + shardTookMs + "ms, elapsed: " + elapsed + "s)"
+                        + " docs (index total: " + totalExported + ", open: " + (openNanos / 1_000_000L) + "ms, shard: "
+                        + shardTookMs + "ms, elapsed: " + elapsed + "s)"
                 );
             }
         }

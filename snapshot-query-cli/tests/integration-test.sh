@@ -813,6 +813,7 @@ fi
 # ── Export Test 10: export-range latest-per-index ────────────────────────────
 
 RANGE_EXPORT_DIR="$EXPORT_DIR/export-range-latest"
+RANGE_PROFILE="$EXPORT_DIR/export-range-latest-profile.json"
 mkdir -p "$RANGE_EXPORT_DIR"
 echo -e "\033[1;34m==>\033[0m Export test: export-range latest-per-index" >&2
 "$JAVA" -jar "$JAR_PATH" export-range \
@@ -823,7 +824,8 @@ echo -e "\033[1;34m==>\033[0m Export test: export-range latest-per-index" >&2
     --query '{"match_all":{}}' \
     --from-date 2024-01-15 \
     --to-date 2024-01-17 \
-    --output-dir "$RANGE_EXPORT_DIR" 2>/dev/null || true
+    --output-dir "$RANGE_EXPORT_DIR" \
+    --profile-file "$RANGE_PROFILE" 2>/dev/null || true
 
 FILE_COUNT=$(find "$RANGE_EXPORT_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
 TOTAL_LINES=$(find "$RANGE_EXPORT_DIR" -name '*.jsonl' -exec cat {} \; | wc -l | tr -d ' ')
@@ -844,7 +846,47 @@ else
     fail "export-range latest-per-index: missing output for ${RANGE_INDEX_TWO}"
 fi
 
-# ── Export Test 11: export-range --all-snapshots ─────────────────────────────
+if [ -f "$RANGE_PROFILE" ] &&
+    echo "$(<"$RANGE_PROFILE")" | jq -e '.phases.query_parse_ms >= 0 and .s3.read_range_calls >= 0 and (.indices | length) == 3 and (.lucene_files | length) > 0' >/dev/null 2>&1; then
+    ok "export-range latest-per-index: wrote profiling counters"
+else
+    fail "export-range latest-per-index: profiling output missing or invalid"
+fi
+
+# ── Export Test 11: export-range interrupted still writes profile ────────────
+
+INTERRUPTED_PROFILE="$EXPORT_DIR/export-range-interrupted-profile.json"
+INTERRUPTED_EXPORT_DIR="$EXPORT_DIR/export-range-interrupted"
+mkdir -p "$INTERRUPTED_EXPORT_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: export-range interrupted writes profile" >&2
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index-pattern '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$INTERRUPTED_EXPORT_DIR" \
+    --profile-file "$INTERRUPTED_PROFILE" >/dev/null 2>&1 &
+INTERRUPTED_PID=$!
+for _ in $(seq 1 20); do
+    if ! kill -0 "$INTERRUPTED_PID" >/dev/null 2>&1; then
+        break
+    fi
+    kill -INT "$INTERRUPTED_PID" >/dev/null 2>&1 || true
+    sleep 0.05
+done
+wait "$INTERRUPTED_PID" >/dev/null 2>&1 || true
+
+if [ -f "$INTERRUPTED_PROFILE" ] &&
+    echo "$(<"$INTERRUPTED_PROFILE")" | jq -e '.summary.total_ms >= 0 and (.summary.exit_reason == "interrupted" or .summary.exit_reason == "completed")' >/dev/null 2>&1; then
+    ok "export-range interrupted: left a valid profiling file"
+else
+    fail "export-range interrupted: profiling output missing or invalid"
+fi
+
+# ── Export Test 12: export-range --all-snapshots ─────────────────────────────
 
 RANGE_EXPORT_ALL_DIR="$EXPORT_DIR/export-range-all"
 mkdir -p "$RANGE_EXPORT_ALL_DIR"

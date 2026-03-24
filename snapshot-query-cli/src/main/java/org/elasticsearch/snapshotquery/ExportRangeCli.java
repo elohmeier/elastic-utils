@@ -16,13 +16,16 @@ import org.elasticsearch.core.SuppressForbidden;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ExportRangeCli extends Command {
 
@@ -38,6 +41,7 @@ public class ExportRangeCli extends Command {
     private final OptionSpec<String> compressionOption;
     private final OptionSpec<Integer> batchSizeOption;
     private final OptionSpec<Void> allSnapshotsOption;
+    private final OptionSpec<String> profileFileOption;
 
     public ExportRangeCli() {
         super("Export many snapshot/index pairs for an index date range in a single JVM");
@@ -53,6 +57,7 @@ public class ExportRangeCli extends Command {
         compressionOption = parser.accepts("compression", "Compression: none, zstd").withRequiredArg().defaultsTo("none");
         batchSizeOption = parser.accepts("batch-size", "Documents per search batch").withRequiredArg().ofType(Integer.class).defaultsTo(10000);
         allSnapshotsOption = parser.accepts("all-snapshots", "Export all matching snapshot/index pairs instead of only the newest snapshot per index");
+        profileFileOption = parser.accepts("profile-file", "Write JSON profiling counters to this file").withRequiredArg();
     }
 
     @Override
@@ -68,8 +73,15 @@ public class ExportRangeCli extends Command {
         String compression = compressionOption.value(options);
         int batchSize = batchSizeOption.value(options);
         boolean allSnapshots = options.has(allSnapshotsOption);
+        String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
+        ProfilingRecorder profilingRecorder = profileFile != null ? new ProfilingRecorder() : null;
+        ProfileFileWriter profileFileWriter = ProfileFileWriter.create(profileFile, profilingRecorder);
 
+        long queryParseStartNanos = System.nanoTime();
         SearchBodyParser searchBody = parseSearchBody(options, fromDate, toDate);
+        if (profilingRecorder != null) {
+            profilingRecorder.addPhaseNanos("query_parse", System.nanoTime() - queryParseStartNanos);
+        }
         Query luceneQuery = searchBody.query();
         Sort sort = searchBody.sort();
         List<String> sourceFields = searchBody.sourceFields();
@@ -83,20 +95,29 @@ public class ExportRangeCli extends Command {
         ensureDirectory(outputDir);
 
         terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
-        try (S3ClientFactory.S3Access s3Access = s3Options.connect(options)) {
+        long connectStartNanos = System.nanoTime();
+        try (S3ClientFactory.S3Access s3Access = s3Options.connect(options, profilingRecorder)) {
+            if (profilingRecorder != null) {
+                profilingRecorder.addPhaseNanos("s3_connect", System.nanoTime() - connectStartNanos);
+            }
             BlobContainer rootContainer = s3Access.rootContainer();
             SnapshotMetadataLoader metadataLoader = new SnapshotMetadataLoader(rootContainer, s3Access);
 
             terminal.errorPrintln("Discovering snapshot/index pairs...");
+            long discoveryStartNanos = System.nanoTime();
             List<SnapshotMetadataLoader.ExportTarget> targets = metadataLoader.findExportTargets(
                 indexPattern,
                 minIndexDate,
                 maxIndexDate,
                 !allSnapshots
             );
+            if (profilingRecorder != null) {
+                profilingRecorder.addPhaseNanos("target_discovery", System.nanoTime() - discoveryStartNanos);
+            }
 
             if (targets.isEmpty()) {
                 terminal.errorPrintln("No matching snapshot/index pairs found");
+                profileFileWriter.flushCompleted();
                 return;
             }
 
@@ -110,7 +131,12 @@ public class ExportRangeCli extends Command {
                 terminal.errorPrintln("[" + current + "/" + targets.size() + "] Exporting " + target.indexName() + " from " + target.snapshotName() + "...");
 
                 try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
+                    long resolveStartNanos = System.nanoTime();
                     SnapshotMetadataLoader.ResolvedIndex resolved = metadataLoader.resolve(target.snapshotName(), target.indexName());
+                    if (profilingRecorder != null) {
+                        profilingRecorder.recordIndexResolve(target.indexName(), target.snapshotName(), System.nanoTime() - resolveStartNanos);
+                    }
+                    long exportStartNanos = System.nanoTime();
                     long exported = SnapshotExportSupport.exportResolvedIndex(
                         terminal,
                         metadataLoader,
@@ -120,9 +146,19 @@ public class ExportRangeCli extends Command {
                         sourceFields,
                         batchSize,
                         out,
-                        startTime
+                        startTime,
+                        profilingRecorder
                     );
                     out.flush();
+                    if (profilingRecorder != null) {
+                        profilingRecorder.recordIndexExport(
+                            target.indexName(),
+                            target.snapshotName(),
+                            outputPath,
+                            exported,
+                            System.nanoTime() - exportStartNanos
+                        );
+                    }
                     totalExported += exported;
                     terminal.errorPrintln("  Index complete: " + exported + " docs -> " + outputPath);
                 }
@@ -130,6 +166,7 @@ public class ExportRangeCli extends Command {
 
             long tookMs = System.currentTimeMillis() - startTime;
             terminal.errorPrintln("Export-range complete: " + totalExported + " documents in " + (tookMs / 1000) + "s");
+            profileFileWriter.flushCompleted();
         }
     }
 
@@ -186,5 +223,73 @@ public class ExportRangeCli extends Command {
     private static void ensureDirectory(String outputDir) throws IOException {
         Path path = PathUtils.get(outputDir);
         Files.createDirectories(path);
+    }
+
+    private static final class ProfileFileWriter {
+        private final Path outputPath;
+        private final ProfilingRecorder profilingRecorder;
+        private final AtomicBoolean flushed = new AtomicBoolean();
+        private final Thread shutdownHook;
+
+        private ProfileFileWriter(Path outputPath, ProfilingRecorder profilingRecorder) {
+            this.outputPath = outputPath;
+            this.profilingRecorder = profilingRecorder;
+            this.shutdownHook = new Thread(() -> {
+                try {
+                    flushInterrupted();
+                } catch (IOException ignored) {
+                    // best effort during shutdown
+                }
+            }, "snapshot-query-profile-shutdown-hook");
+        }
+
+        static ProfileFileWriter create(String profileFile, ProfilingRecorder profilingRecorder) {
+            if (profileFile == null || profilingRecorder == null) {
+                return new ProfileFileWriter(null, null);
+            }
+            ProfileFileWriter writer = new ProfileFileWriter(PathUtils.get(profileFile), profilingRecorder);
+            Runtime.getRuntime().addShutdownHook(writer.shutdownHook);
+            return writer;
+        }
+
+        void flushCompleted() throws IOException {
+            if (profilingRecorder == null || outputPath == null || !flushed.compareAndSet(false, true)) {
+                return;
+            }
+            profilingRecorder.markCompleted();
+            writeAtomically();
+            removeShutdownHook();
+        }
+
+        void flushInterrupted() throws IOException {
+            if (profilingRecorder == null || outputPath == null || !flushed.compareAndSet(false, true)) {
+                return;
+            }
+            profilingRecorder.markInterrupted();
+            writeAtomically();
+        }
+
+        @SuppressForbidden(reason = "write profile file for cli")
+        private void writeAtomically() throws IOException {
+            Path parent = outputPath.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Path tempFile = outputPath.resolveSibling(outputPath.getFileName() + ".tmp");
+            Files.writeString(tempFile, profilingRecorder.renderJson());
+            try {
+                Files.move(tempFile, outputPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tempFile, outputPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+
+        private void removeShutdownHook() {
+            try {
+                Runtime.getRuntime().removeShutdownHook(shutdownHook);
+            } catch (IllegalStateException ignored) {
+                // JVM is already shutting down
+            }
+        }
     }
 }

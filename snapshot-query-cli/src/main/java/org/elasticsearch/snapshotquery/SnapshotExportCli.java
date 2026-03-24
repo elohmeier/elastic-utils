@@ -114,7 +114,8 @@ public class SnapshotExportCli extends Command {
                     sourceFields,
                     batchSize,
                     out,
-                    startTime
+                    startTime,
+                    null
                 );
             }
 

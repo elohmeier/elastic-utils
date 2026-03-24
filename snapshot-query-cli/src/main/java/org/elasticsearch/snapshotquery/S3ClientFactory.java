@@ -47,7 +47,8 @@ public class S3ClientFactory {
         @Nullable String accessKey,
         @Nullable String secretKey,
         boolean trustAllCerts,
-        @Nullable String resolve
+        @Nullable String resolve,
+        @Nullable ProfilingRecorder profilingRecorder
     ) {
         AwsCredentialsProvider credentialsProvider;
         if (accessKey != null && secretKey != null) {
@@ -97,18 +98,20 @@ public class S3ClientFactory {
 
         S3Client client = builder.build();
         BlobPath rootPath = basePath.isEmpty() ? BlobPath.EMPTY : BlobPath.EMPTY.add(basePath);
-        return new S3Access(client, bucket, rootPath);
+        return new S3Access(client, bucket, rootPath, profilingRecorder);
     }
 
     public static class S3Access implements Closeable {
         private final S3Client client;
         private final String bucket;
         private final BlobPath rootPath;
+        private final ProfilingRecorder profilingRecorder;
 
-        S3Access(S3Client client, String bucket, BlobPath rootPath) {
+        S3Access(S3Client client, String bucket, BlobPath rootPath, @Nullable ProfilingRecorder profilingRecorder) {
             this.client = client;
             this.bucket = bucket;
             this.rootPath = rootPath;
+            this.profilingRecorder = profilingRecorder;
         }
 
         public BlobContainer rootContainer() {
@@ -116,7 +119,7 @@ public class S3ClientFactory {
         }
 
         public BlobContainer containerFor(BlobPath path) {
-            return new SimpleS3BlobContainer(client, bucket, path);
+            return new SimpleS3BlobContainer(client, bucket, path, profilingRecorder);
         }
 
         @Override
@@ -133,11 +136,13 @@ public class S3ClientFactory {
         private final S3Client client;
         private final String bucket;
         private final BlobPath path;
+        private final ProfilingRecorder profilingRecorder;
 
-        SimpleS3BlobContainer(S3Client client, String bucket, BlobPath path) {
+        SimpleS3BlobContainer(S3Client client, String bucket, BlobPath path, @Nullable ProfilingRecorder profilingRecorder) {
             this.client = client;
             this.bucket = bucket;
             this.path = path;
+            this.profilingRecorder = profilingRecorder;
         }
 
         private String blobKey(String blobName) {
@@ -152,19 +157,31 @@ public class S3ClientFactory {
 
         @Override
         public boolean blobExists(OperationPurpose purpose, String blobName) throws IOException {
+            long startNanos = System.nanoTime();
             try {
                 client.headObject(b -> b.bucket(bucket).key(blobKey(blobName)));
+                if (profilingRecorder != null) {
+                    profilingRecorder.recordS3Head(System.nanoTime() - startNanos);
+                }
                 return true;
             } catch (NoSuchKeyException e) {
+                if (profilingRecorder != null) {
+                    profilingRecorder.recordS3Head(System.nanoTime() - startNanos);
+                }
                 return false;
             }
         }
 
         @Override
         public InputStream readBlob(OperationPurpose purpose, String blobName) throws IOException {
+            long startNanos = System.nanoTime();
             try {
                 GetObjectRequest request = GetObjectRequest.builder().bucket(bucket).key(blobKey(blobName)).build();
-                return client.getObject(request);
+                InputStream inputStream = client.getObject(request);
+                if (profilingRecorder == null) {
+                    return inputStream;
+                }
+                return new ProfilingInputStream(inputStream, profilingRecorder, false, -1, startNanos);
             } catch (NoSuchKeyException e) {
                 throw new NoSuchFileException("Blob [" + blobKey(blobName) + "] not found in bucket [" + bucket + "]");
             }
@@ -172,10 +189,15 @@ public class S3ClientFactory {
 
         @Override
         public InputStream readBlob(OperationPurpose purpose, String blobName, long position, long length) throws IOException {
+            long startNanos = System.nanoTime();
             try {
                 String range = "bytes=" + position + "-" + (position + length - 1);
                 GetObjectRequest request = GetObjectRequest.builder().bucket(bucket).key(blobKey(blobName)).range(range).build();
-                return client.getObject(request);
+                InputStream inputStream = client.getObject(request);
+                if (profilingRecorder == null) {
+                    return inputStream;
+                }
+                return new ProfilingInputStream(inputStream, profilingRecorder, true, length, startNanos);
             } catch (NoSuchKeyException e) {
                 throw new NoSuchFileException("Blob [" + blobKey(blobName) + "] not found in bucket [" + bucket + "]");
             }
@@ -193,11 +215,15 @@ public class S3ClientFactory {
             String continuationToken = null;
 
             do {
+                long startNanos = System.nanoTime();
                 ListObjectsV2Request.Builder reqBuilder = ListObjectsV2Request.builder().bucket(bucket).prefix(prefix).delimiter("/");
                 if (continuationToken != null) {
                     reqBuilder.continuationToken(continuationToken);
                 }
                 ListObjectsV2Response response = client.listObjectsV2(reqBuilder.build());
+                if (profilingRecorder != null) {
+                    profilingRecorder.recordS3List(System.nanoTime() - startNanos);
+                }
                 for (S3Object obj : response.contents()) {
                     String fullKey = obj.key();
                     String blobName = fullKey.substring(path.buildAsString().length());
@@ -276,6 +302,61 @@ public class S3ClientFactory {
             org.elasticsearch.action.ActionListener<org.elasticsearch.common.blobstore.OptionalBytesReference> listener
         ) {
             throw new UnsupportedOperationException("Read-only blob container");
+        }
+    }
+
+    private static final class ProfilingInputStream extends InputStream {
+        private final InputStream delegate;
+        private final ProfilingRecorder profilingRecorder;
+        private final boolean ranged;
+        private final long requestedBytes;
+        private final long startNanos;
+        private long bytesRead;
+        private boolean closed;
+
+        private ProfilingInputStream(
+            InputStream delegate,
+            ProfilingRecorder profilingRecorder,
+            boolean ranged,
+            long requestedBytes,
+            long startNanos
+        ) {
+            this.delegate = delegate;
+            this.profilingRecorder = profilingRecorder;
+            this.ranged = ranged;
+            this.requestedBytes = requestedBytes;
+            this.startNanos = startNanos;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int value = delegate.read();
+            if (value >= 0) {
+                bytesRead++;
+            }
+            return value;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int count = delegate.read(b, off, len);
+            if (count > 0) {
+                bytesRead += count;
+            }
+            return count;
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                delegate.close();
+            } finally {
+                profilingRecorder.recordS3Read(ranged, Math.max(requestedBytes, bytesRead), bytesRead, System.nanoTime() - startNanos);
+            }
         }
     }
 }
