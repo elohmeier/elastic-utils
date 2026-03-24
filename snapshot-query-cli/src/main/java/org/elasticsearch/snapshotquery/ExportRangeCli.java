@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ExportRangeCli extends Command {
+    private static final long PROGRESS_INTERVAL_MS = 5000L;
 
     private final S3Options s3Options;
     private final OptionSpec<String> indexPatternOption;
@@ -74,14 +75,13 @@ public class ExportRangeCli extends Command {
         int batchSize = batchSizeOption.value(options);
         boolean allSnapshots = options.has(allSnapshotsOption);
         String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
-        ProfilingRecorder profilingRecorder = profileFile != null ? new ProfilingRecorder() : null;
+        ProfilingRecorder profilingRecorder = new ProfilingRecorder();
         ProfileFileWriter profileFileWriter = ProfileFileWriter.create(profileFile, profilingRecorder);
+        ProgressReporter progressReporter = new ProgressReporter(terminal, profilingRecorder);
 
         long queryParseStartNanos = System.nanoTime();
         SearchBodyParser searchBody = parseSearchBody(options, fromDate, toDate);
-        if (profilingRecorder != null) {
-            profilingRecorder.addPhaseNanos("query_parse", System.nanoTime() - queryParseStartNanos);
-        }
+        profilingRecorder.addPhaseNanos("query_parse", System.nanoTime() - queryParseStartNanos);
         Query luceneQuery = searchBody.query();
         Sort sort = searchBody.sort();
         List<String> sourceFields = searchBody.sourceFields();
@@ -96,14 +96,16 @@ public class ExportRangeCli extends Command {
 
         terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
         long connectStartNanos = System.nanoTime();
-        try (S3ClientFactory.S3Access s3Access = s3Options.connect(options, profilingRecorder)) {
-            if (profilingRecorder != null) {
-                profilingRecorder.addPhaseNanos("s3_connect", System.nanoTime() - connectStartNanos);
-            }
+        try (
+            S3ClientFactory.S3Access s3Access = s3Options.connect(options, profilingRecorder);
+            ProgressReporter ignored = progressReporter
+        ) {
+            profilingRecorder.addPhaseNanos("s3_connect", System.nanoTime() - connectStartNanos);
             BlobContainer rootContainer = s3Access.rootContainer();
             SnapshotMetadataLoader metadataLoader = new SnapshotMetadataLoader(rootContainer, s3Access);
 
             terminal.errorPrintln("Discovering snapshot/index pairs...");
+            profilingRecorder.setCurrentStage("discovering");
             long discoveryStartNanos = System.nanoTime();
             List<SnapshotMetadataLoader.ExportTarget> targets = metadataLoader.findExportTargets(
                 indexPattern,
@@ -111,9 +113,7 @@ public class ExportRangeCli extends Command {
                 maxIndexDate,
                 !allSnapshots
             );
-            if (profilingRecorder != null) {
-                profilingRecorder.addPhaseNanos("target_discovery", System.nanoTime() - discoveryStartNanos);
-            }
+            profilingRecorder.addPhaseNanos("target_discovery", System.nanoTime() - discoveryStartNanos);
 
             if (targets.isEmpty()) {
                 terminal.errorPrintln("No matching snapshot/index pairs found");
@@ -124,18 +124,18 @@ public class ExportRangeCli extends Command {
             terminal.errorPrintln("Found " + targets.size() + " snapshot/index pairs to export");
             long totalExported = 0;
             int current = 0;
+            profilingRecorder.setTargetTotals(0, targets.size());
 
             for (SnapshotMetadataLoader.ExportTarget target : targets) {
                 current++;
+                profilingRecorder.startTarget(target.snapshotName(), target.indexName(), current - 1, targets.size());
                 String outputPath = buildOutputPath(outputDir, target, compression, allSnapshots, targets);
                 terminal.errorPrintln("[" + current + "/" + targets.size() + "] Exporting " + target.indexName() + " from " + target.snapshotName() + "...");
 
                 try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
                     long resolveStartNanos = System.nanoTime();
                     SnapshotMetadataLoader.ResolvedIndex resolved = metadataLoader.resolve(target.snapshotName(), target.indexName());
-                    if (profilingRecorder != null) {
-                        profilingRecorder.recordIndexResolve(target.indexName(), target.snapshotName(), System.nanoTime() - resolveStartNanos);
-                    }
+                    profilingRecorder.recordIndexResolve(target.indexName(), target.snapshotName(), System.nanoTime() - resolveStartNanos);
                     long exportStartNanos = System.nanoTime();
                     long exported = SnapshotExportSupport.exportResolvedIndex(
                         terminal,
@@ -150,16 +150,15 @@ public class ExportRangeCli extends Command {
                         profilingRecorder
                     );
                     out.flush();
-                    if (profilingRecorder != null) {
-                        profilingRecorder.recordIndexExport(
-                            target.indexName(),
-                            target.snapshotName(),
-                            outputPath,
-                            exported,
-                            System.nanoTime() - exportStartNanos
-                        );
-                    }
+                    profilingRecorder.recordIndexExport(
+                        target.indexName(),
+                        target.snapshotName(),
+                        outputPath,
+                        exported,
+                        System.nanoTime() - exportStartNanos
+                    );
                     totalExported += exported;
+                    profilingRecorder.finishTarget(current, targets.size());
                     terminal.errorPrintln("  Index complete: " + exported + " docs -> " + outputPath);
                 }
             }
@@ -290,6 +289,64 @@ public class ExportRangeCli extends Command {
             } catch (IllegalStateException ignored) {
                 // JVM is already shutting down
             }
+        }
+    }
+
+    private static final class ProgressReporter implements AutoCloseable {
+        private final AtomicBoolean running = new AtomicBoolean(true);
+        private final Thread thread;
+
+        private ProgressReporter(Terminal terminal, ProfilingRecorder profilingRecorder) {
+            this.thread = new Thread(() -> {
+                while (running.get()) {
+                    try {
+                        Thread.sleep(PROGRESS_INTERVAL_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (!running.get()) {
+                        return;
+                    }
+
+                    String indexName = profilingRecorder.currentIndexName();
+                    String snapshotName = profilingRecorder.currentSnapshotName();
+                    int shardId = profilingRecorder.currentShardId();
+                    String shardText = shardId >= 0 ? " shard=" + shardId : "";
+                    terminal.errorPrintln(
+                        "Progress: "
+                            + profilingRecorder.completedTargets() + "/" + profilingRecorder.totalTargets()
+                            + " indices complete"
+                            + (indexName != null ? ", index=" + indexName : "")
+                            + (snapshotName != null ? ", snapshot=" + snapshotName : "")
+                            + shardText
+                            + ", stage=" + profilingRecorder.currentStage()
+                            + ", docs=" + profilingRecorder.totalDocsExported()
+                            + ", s3_bytes=" + humanBytes(profilingRecorder.s3BytesRead())
+                            + ", s3_calls(full/range)=" + profilingRecorder.s3ReadFullCalls() + "/" + profilingRecorder.s3ReadRangeCalls()
+                            + ", elapsed=" + (profilingRecorder.totalMillis() / 1000) + "s"
+                    );
+                }
+            }, "snapshot-export-progress");
+            this.thread.setDaemon(true);
+            this.thread.start();
+        }
+
+        @Override
+        public void close() {
+            running.set(false);
+            thread.interrupt();
+        }
+
+        private static String humanBytes(long bytes) {
+            double value = bytes;
+            String[] units = { "B", "KiB", "MiB", "GiB", "TiB" };
+            int unit = 0;
+            while (value >= 1024 && unit < units.length - 1) {
+                value /= 1024.0;
+                unit++;
+            }
+            return String.format(java.util.Locale.ROOT, "%.1f%s", value, units[unit]);
         }
     }
 }

@@ -17,6 +17,12 @@ final class ProfilingRecorder {
     private final long startedAtNanos = System.nanoTime();
     private volatile boolean partial;
     private volatile String exitReason = "running";
+    private volatile String currentSnapshotName;
+    private volatile String currentIndexName;
+    private volatile int currentShardId = -1;
+    private volatile String currentStage = "starting";
+    private volatile int completedTargets;
+    private volatile int totalTargets;
 
     private final Map<String, AtomicLong> phaseNanos = new ConcurrentHashMap<>();
     private final AtomicLong s3HeadCalls = new AtomicLong();
@@ -37,14 +43,46 @@ final class ProfilingRecorder {
         phaseNanos.computeIfAbsent(phase, ignored -> new AtomicLong()).addAndGet(nanos);
     }
 
+    void setTargetTotals(int completedTargets, int totalTargets) {
+        this.completedTargets = completedTargets;
+        this.totalTargets = totalTargets;
+    }
+
+    void startTarget(String snapshotName, String indexName, int completedTargets, int totalTargets) {
+        currentSnapshotName = snapshotName;
+        currentIndexName = indexName;
+        currentShardId = -1;
+        currentStage = "resolving";
+        setTargetTotals(completedTargets, totalTargets);
+    }
+
+    void setCurrentStage(String stage) {
+        currentStage = stage;
+    }
+
+    void startShard(String indexName, int shardId, String stage) {
+        currentIndexName = indexName;
+        currentShardId = shardId;
+        currentStage = stage;
+    }
+
+    void finishTarget(int completedTargets, int totalTargets) {
+        this.completedTargets = completedTargets;
+        this.totalTargets = totalTargets;
+        currentShardId = -1;
+        currentStage = "idle";
+    }
+
     void markCompleted() {
         partial = false;
         exitReason = "completed";
+        currentStage = "completed";
     }
 
     void markInterrupted() {
         partial = true;
         exitReason = "interrupted";
+        currentStage = "interrupted";
     }
 
     void recordS3Head(long nanos) {
@@ -179,6 +217,50 @@ final class ProfilingRecorder {
             builder.endObject();
         }
         return baos.toString();
+    }
+
+    long totalMillis() {
+        return nanosToMillis(System.nanoTime() - startedAtNanos);
+    }
+
+    long s3BytesRead() {
+        return s3BytesRead.get();
+    }
+
+    long s3ReadRangeCalls() {
+        return s3ReadRangeCalls.get();
+    }
+
+    long s3ReadFullCalls() {
+        return s3ReadFullCalls.get();
+    }
+
+    long totalDocsExported() {
+        return indices.values().stream().mapToLong(stats -> stats.docsExported.get()).sum();
+    }
+
+    String currentSnapshotName() {
+        return currentSnapshotName;
+    }
+
+    String currentIndexName() {
+        return currentIndexName;
+    }
+
+    int currentShardId() {
+        return currentShardId;
+    }
+
+    String currentStage() {
+        return currentStage;
+    }
+
+    int completedTargets() {
+        return completedTargets;
+    }
+
+    int totalTargets() {
+        return totalTargets;
     }
 
     private ShardStats shardStats(String indexName, int shardId) {

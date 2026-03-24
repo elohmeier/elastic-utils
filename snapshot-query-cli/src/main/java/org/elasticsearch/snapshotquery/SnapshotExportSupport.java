@@ -57,6 +57,9 @@ final class SnapshotExportSupport {
             int shardId = shardSnapshot.shardId();
             BlobContainer shardContainer = metadataLoader.shardContainer(resolved.indexId(), shardId);
             BlobStoreIndexShardSnapshot blobStoreSnapshot = shardSnapshot.snapshot();
+            if (profilingRecorder != null) {
+                profilingRecorder.startShard(indexName, shardId, "opening");
+            }
 
             long openStartNanos = System.nanoTime();
             try (
@@ -66,6 +69,7 @@ final class SnapshotExportSupport {
                 long openNanos = System.nanoTime() - openStartNanos;
                 if (profilingRecorder != null) {
                     profilingRecorder.recordShardOpen(indexName, shardId, openNanos);
+                    profilingRecorder.startShard(indexName, shardId, "searching");
                 }
                 IndexSearcher searcher = new IndexSearcher(reader);
                 long shardStartNanos = System.nanoTime();
@@ -83,6 +87,9 @@ final class SnapshotExportSupport {
                         + " docs (index total: " + totalExported + ", open: " + (openNanos / 1_000_000L) + "ms, shard: "
                         + shardTookMs + "ms, elapsed: " + elapsed + "s)"
                 );
+                if (profilingRecorder != null) {
+                    profilingRecorder.startShard(indexName, shardId, "done");
+                }
             }
         }
 
