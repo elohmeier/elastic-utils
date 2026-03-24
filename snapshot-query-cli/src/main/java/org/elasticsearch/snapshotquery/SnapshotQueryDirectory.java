@@ -138,8 +138,11 @@ public class SnapshotQueryDirectory extends BaseDirectory {
      * IndexInput that reads from an S3 BlobContainer, handling multi-part files.
      */
     static class S3IndexInput extends BufferedIndexInput {
-        private static final int READ_AHEAD_BYTES = 256 * 1024;
-        private static final long SMALL_FILE_CACHE_BYTES = 4L * 1024 * 1024;
+        private static final int DEFAULT_READ_AHEAD_BYTES = 1024 * 1024;
+        private static final int STORED_FIELDS_READ_AHEAD_BYTES = 4 * 1024 * 1024;
+        private static final int DOC_VALUES_READ_AHEAD_BYTES = 2 * 1024 * 1024;
+        private static final long DEFAULT_FULL_CACHE_BYTES = 4L * 1024 * 1024;
+        private static final long LARGE_METADATA_FULL_CACHE_BYTES = 16L * 1024 * 1024;
 
         private final BlobContainer blobContainer;
         private final FileInfo fileInfo;
@@ -183,7 +186,7 @@ public class SnapshotQueryDirectory extends BaseDirectory {
             long pos = offset + getFilePointer();
             int remaining = b.remaining();
 
-            if (length <= SMALL_FILE_CACHE_BYTES) {
+            if (shouldFullSliceCache()) {
                 ensureFullSliceCache();
                 int cacheOffset = Math.toIntExact(pos - offset);
                 b.put(fullSliceCache, cacheOffset, remaining);
@@ -200,7 +203,7 @@ public class SnapshotQueryDirectory extends BaseDirectory {
                     continue;
                 }
 
-                int toFetch = Math.toIntExact(Math.min(length - (pos - offset), Math.max(remaining, READ_AHEAD_BYTES)));
+                int toFetch = Math.toIntExact(Math.min(length - (pos - offset), Math.max(remaining, readAheadBytes())));
                 readaheadCache = fetchBytes(pos, toFetch);
                 readaheadStart = pos;
                 readaheadLength = readaheadCache.length;
@@ -258,6 +261,33 @@ public class SnapshotQueryDirectory extends BaseDirectory {
             if (fullSliceCache == null) {
                 fullSliceCache = fetchBytes(offset, Math.toIntExact(length));
             }
+        }
+
+        private boolean shouldFullSliceCache() {
+            String fileName = fileInfo.physicalName();
+            if (length <= DEFAULT_FULL_CACHE_BYTES) {
+                return true;
+            }
+            return length <= LARGE_METADATA_FULL_CACHE_BYTES && (
+                fileName.endsWith(".fdx")
+                    || fileName.endsWith(".dvm")
+                    || fileName.endsWith(".kdd")
+                    || fileName.endsWith(".kdi")
+                    || fileName.endsWith(".doc")
+                    || fileName.endsWith(".tim")
+                    || fileName.endsWith(".tip")
+            );
+        }
+
+        private int readAheadBytes() {
+            String fileName = fileInfo.physicalName();
+            if (fileName.endsWith(".fdt")) {
+                return STORED_FIELDS_READ_AHEAD_BYTES;
+            }
+            if (fileName.endsWith(".dvd")) {
+                return DOC_VALUES_READ_AHEAD_BYTES;
+            }
+            return DEFAULT_READ_AHEAD_BYTES;
         }
 
         private byte[] fetchBytes(long absolutePosition, int len) throws IOException {
