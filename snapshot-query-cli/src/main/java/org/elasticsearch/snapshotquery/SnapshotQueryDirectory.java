@@ -138,6 +138,9 @@ public class SnapshotQueryDirectory extends BaseDirectory {
      * IndexInput that reads from an S3 BlobContainer, handling multi-part files.
      */
     static class S3IndexInput extends BufferedIndexInput {
+        private static final int READ_AHEAD_BYTES = 256 * 1024;
+        private static final long SMALL_FILE_CACHE_BYTES = 4L * 1024 * 1024;
+
         private final BlobContainer blobContainer;
         private final FileInfo fileInfo;
         private final long offset;
@@ -145,6 +148,10 @@ public class SnapshotQueryDirectory extends BaseDirectory {
         private final ProfilingRecorder profilingRecorder;
         private final String indexName;
         private final int shardId;
+        private byte[] fullSliceCache;
+        private byte[] readaheadCache;
+        private long readaheadStart = -1;
+        private int readaheadLength;
 
         S3IndexInput(String name, BlobContainer blobContainer, FileInfo fileInfo) {
             this(name, blobContainer, fileInfo, null, null, -1, 0, fileInfo.length(), BufferedIndexInput.BUFFER_SIZE);
@@ -176,32 +183,27 @@ public class SnapshotQueryDirectory extends BaseDirectory {
             long pos = offset + getFilePointer();
             int remaining = b.remaining();
 
+            if (length <= SMALL_FILE_CACHE_BYTES) {
+                ensureFullSliceCache();
+                int cacheOffset = Math.toIntExact(pos - offset);
+                b.put(fullSliceCache, cacheOffset, remaining);
+                return;
+            }
+
             while (remaining > 0) {
-                // Determine which part contains this position
-                int part = fileInfo.numberOfParts() == 1 ? 0 : (int) (pos / fileInfo.partBytes(0));
-                if (part >= fileInfo.numberOfParts()) {
-                    throw new EOFException("Read past end of file: position=" + pos + " length=" + fileInfo.length());
+                if (readaheadContains(pos)) {
+                    int cacheOffset = Math.toIntExact(pos - readaheadStart);
+                    int fromCache = Math.min(remaining, readaheadLength - cacheOffset);
+                    b.put(readaheadCache, cacheOffset, fromCache);
+                    remaining -= fromCache;
+                    pos += fromCache;
+                    continue;
                 }
 
-                long partStart = (long) part * fileInfo.partBytes(0);
-                long posInPart = pos - partStart;
-                long partLen = fileInfo.partBytes(part);
-                int toRead = (int) Math.min(remaining, partLen - posInPart);
-
-                String blobName = fileInfo.partName(part);
-                long readStartNanos = System.nanoTime();
-                try (InputStream is = blobContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, blobName, posInPart, toRead)) {
-                    byte[] buf = is.readNBytes(toRead);
-                    b.put(buf);
-                    remaining -= buf.length;
-                    pos += buf.length;
-                    if (profilingRecorder != null && indexName != null) {
-                        profilingRecorder.recordLuceneFileRead(indexName, shardId, fileInfo.physicalName(), buf.length, System.nanoTime() - readStartNanos);
-                    }
-                    if (buf.length < toRead) {
-                        throw new EOFException("Short read from S3: expected " + toRead + " bytes but got " + buf.length);
-                    }
-                }
+                int toFetch = Math.toIntExact(Math.min(length - (pos - offset), Math.max(remaining, READ_AHEAD_BYTES)));
+                readaheadCache = fetchBytes(pos, toFetch);
+                readaheadStart = pos;
+                readaheadLength = readaheadCache.length;
             }
         }
 
@@ -240,13 +242,56 @@ public class SnapshotQueryDirectory extends BaseDirectory {
 
         @Override
         public S3IndexInput clone() {
-            S3IndexInput cloned = (S3IndexInput) super.clone();
-            return cloned;
+            return (S3IndexInput) super.clone();
         }
 
         @Override
         public void close() {
             // nothing to close; each read opens/closes its own stream
+        }
+
+        private boolean readaheadContains(long pos) {
+            return readaheadCache != null && pos >= readaheadStart && pos < readaheadStart + readaheadLength;
+        }
+
+        private void ensureFullSliceCache() throws IOException {
+            if (fullSliceCache == null) {
+                fullSliceCache = fetchBytes(offset, Math.toIntExact(length));
+            }
+        }
+
+        private byte[] fetchBytes(long absolutePosition, int len) throws IOException {
+            byte[] result = new byte[len];
+            int written = 0;
+            long pos = absolutePosition;
+            long readStartNanos = System.nanoTime();
+
+            while (written < len) {
+                int part = fileInfo.numberOfParts() == 1 ? 0 : (int) (pos / fileInfo.partBytes(0));
+                if (part >= fileInfo.numberOfParts()) {
+                    throw new EOFException("Read past end of file: position=" + pos + " length=" + fileInfo.length());
+                }
+
+                long partStart = (long) part * fileInfo.partBytes(0);
+                long posInPart = pos - partStart;
+                long partLen = fileInfo.partBytes(part);
+                int toRead = (int) Math.min(len - written, partLen - posInPart);
+
+                String blobName = fileInfo.partName(part);
+                try (InputStream is = blobContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, blobName, posInPart, toRead)) {
+                    int partRead = is.readNBytes(result, written, toRead);
+                    written += partRead;
+                    pos += partRead;
+                    if (partRead < toRead) {
+                        throw new EOFException("Short read from S3: expected " + toRead + " bytes but got " + partRead);
+                    }
+                }
+            }
+
+            if (profilingRecorder != null && indexName != null) {
+                profilingRecorder.recordLuceneFileRead(indexName, shardId, fileInfo.physicalName(), written, System.nanoTime() - readStartNanos);
+            }
+            return result;
         }
     }
 
