@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'de.nerdworks'
-version = findProperty('cliVersion') ?: '0.0.0-dev'
+version = '1.0.0'
 
 java {
     toolchain {
