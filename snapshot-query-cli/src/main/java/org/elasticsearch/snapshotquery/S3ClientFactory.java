@@ -4,6 +4,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.apache.ApacheHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
@@ -24,10 +25,14 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.file.NoSuchFileException;
 import java.util.HashMap;
 import java.util.Map;
+
+import org.apache.http.conn.DnsResolver;
 
 /**
  * Creates a minimal S3 client and BlobContainer for standalone snapshot reading.
@@ -40,7 +45,9 @@ public class S3ClientFactory {
         String region,
         @Nullable String endpoint,
         @Nullable String accessKey,
-        @Nullable String secretKey
+        @Nullable String secretKey,
+        boolean trustAllCerts,
+        @Nullable String resolve
     ) {
         AwsCredentialsProvider credentialsProvider;
         if (accessKey != null && secretKey != null) {
@@ -54,6 +61,38 @@ public class S3ClientFactory {
         if (endpoint != null) {
             builder.endpointOverride(URI.create(endpoint));
             builder.forcePathStyle(true); // needed for MinIO and other S3-compatible stores
+        }
+
+        if (trustAllCerts || resolve != null) {
+            ApacheHttpClient.Builder httpBuilder = ApacheHttpClient.builder();
+
+            if (trustAllCerts) {
+                httpBuilder.tlsTrustManagersProvider(() -> new javax.net.ssl.TrustManager[] {
+                    new javax.net.ssl.X509TrustManager() {
+                        public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
+                        public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                        public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                    }
+                });
+            }
+
+            if (resolve != null) {
+                // Format: "hostname:ip" (e.g. "s3-01.example.com:127.0.0.1")
+                String[] parts = resolve.split(":", 2);
+                String resolveHost = parts[0];
+                String resolveIp = parts[1];
+                httpBuilder.dnsResolver(new DnsResolver() {
+                    @Override
+                    public InetAddress[] resolve(String host) throws UnknownHostException {
+                        if (host.equals(resolveHost)) {
+                            return new InetAddress[] { InetAddress.getByName(resolveIp) };
+                        }
+                        return InetAddress.getAllByName(host);
+                    }
+                });
+            }
+
+            builder.httpClient(httpBuilder.build());
         }
 
         S3Client client = builder.build();

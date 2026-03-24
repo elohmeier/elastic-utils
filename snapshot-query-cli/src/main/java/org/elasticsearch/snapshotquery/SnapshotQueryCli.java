@@ -41,6 +41,8 @@ public class SnapshotQueryCli extends Command {
     private final OptionSpec<String> queryFileOption;
     private final OptionSpec<String> queryOption;
     private final OptionSpec<Integer> sizeOption;
+    private final OptionSpec<Void> trustAllCertsOption;
+    private final OptionSpec<String> resolveOption;
 
     public SnapshotQueryCli() {
         super("Query Elasticsearch snapshot data in S3 without a running cluster");
@@ -55,6 +57,8 @@ public class SnapshotQueryCli extends Command {
         queryFileOption = parser.accepts("query-file", "Path to JSON file containing Query DSL").withRequiredArg();
         queryOption = parser.acceptsAll(Arrays.asList("q", "query"), "Inline Query DSL JSON").withRequiredArg();
         sizeOption = parser.accepts("size", "Maximum number of results").withRequiredArg().ofType(Integer.class).defaultsTo(10);
+        trustAllCertsOption = parser.accepts("trust-all-certs", "Disable TLS certificate verification (insecure)");
+        resolveOption = parser.accepts("resolve", "Resolve hostname to IP (format: hostname:ip, e.g. s3.example.com:127.0.0.1)").withRequiredArg();
     }
 
     @Override
@@ -67,6 +71,8 @@ public class SnapshotQueryCli extends Command {
         String endpoint = options.has(endpointOption) ? endpointOption.value(options) : null;
         String accessKey = options.has(accessKeyOption) ? accessKeyOption.value(options) : null;
         String secretKey = options.has(secretKeyOption) ? secretKeyOption.value(options) : null;
+        boolean trustAllCerts = options.has(trustAllCertsOption);
+        String resolve = options.has(resolveOption) ? resolveOption.value(options) : null;
         String snapshotName = snapshotOption.value(options);
         String indexName = indexOption.value(options);
         int size = sizeOption.value(options);
@@ -77,7 +83,7 @@ public class SnapshotQueryCli extends Command {
         terminal.errorPrintln("Snapshot: " + snapshotName + ", Index: " + indexName);
 
         // Step 1: Create S3 blob store
-        try (S3ClientFactory.S3Access s3Access = S3ClientFactory.create(bucket, basePath, region, endpoint, accessKey, secretKey)) {
+        try (S3ClientFactory.S3Access s3Access = S3ClientFactory.create(bucket, basePath, region, endpoint, accessKey, secretKey, trustAllCerts, resolve)) {
             BlobContainer rootContainer = s3Access.rootContainer();
 
             // Step 2: Load snapshot metadata
