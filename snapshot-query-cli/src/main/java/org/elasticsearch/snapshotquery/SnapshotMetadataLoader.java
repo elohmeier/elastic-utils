@@ -127,6 +127,98 @@ public class SnapshotMetadataLoader {
         return path;
     }
 
+    /**
+     * Resolves an index name that may be an alias or wildcard pattern to all matching concrete indices in the snapshot.
+     */
+    public List<ResolvedIndex> resolveIndices(String snapshotName, String indexNameOrAlias) throws IOException {
+        RepositoryData repositoryData = loadRepositoryData();
+
+        SnapshotId snapshotId = null;
+        for (SnapshotId id : repositoryData.getSnapshotIds()) {
+            if (id.getName().equals(snapshotName)) {
+                snapshotId = id;
+                break;
+            }
+        }
+        if (snapshotId == null) {
+            throw new IllegalArgumentException("Snapshot [" + snapshotName + "] not found. Available: "
+                + repositoryData.getSnapshotIds().stream().map(SnapshotId::getName).toList());
+        }
+
+        // Get indices that are part of this snapshot
+        var snapshotIndices = repositoryData.getIndices();
+        List<ResolvedIndex> results = new ArrayList<>();
+
+        // First try exact match on index name
+        IndexId exactMatch = snapshotIndices.get(indexNameOrAlias);
+        if (exactMatch != null) {
+            results.add(resolveWithId(repositoryData, snapshotId, exactMatch));
+            return results;
+        }
+
+        // Check if it's an alias or wildcard pattern
+        boolean isWildcard = indexNameOrAlias.contains("*");
+
+        for (var entry : snapshotIndices.entrySet()) {
+            String concreteIndexName = entry.getKey();
+            IndexId indexId = entry.getValue();
+
+            boolean matches = false;
+            if (isWildcard) {
+                matches = wildcardMatch(concreteIndexName, indexNameOrAlias);
+            }
+
+            if (!matches) {
+                // Check aliases: load index metadata and check getAliases()
+                String metaBlobId = repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
+                BlobContainer idxContainer = indexContainer(indexId);
+                IndexMetadata indexMetadata = BlobStoreRepository.INDEX_METADATA_FORMAT.read(
+                    null, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY
+                );
+
+                if (indexMetadata.getAliases().containsKey(indexNameOrAlias)) {
+                    matches = true;
+                }
+            }
+
+            if (matches) {
+                results.add(resolveWithId(repositoryData, snapshotId, indexId));
+            }
+        }
+
+        if (results.isEmpty()) {
+            throw new IllegalArgumentException("No index or alias [" + indexNameOrAlias + "] found in snapshot [" + snapshotName
+                + "]. Available indices: " + snapshotIndices.keySet());
+        }
+
+        return results;
+    }
+
+    private ResolvedIndex resolveWithId(RepositoryData repositoryData, SnapshotId snapshotId, IndexId indexId) throws IOException {
+        String metaBlobId = repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
+        BlobContainer idxContainer = indexContainer(indexId);
+        IndexMetadata indexMetadata = BlobStoreRepository.INDEX_METADATA_FORMAT.read(
+            null, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY
+        );
+
+        int shardCount = indexMetadata.getNumberOfShards();
+        List<ShardSnapshot> shardSnapshots = new ArrayList<>(shardCount);
+        for (int shard = 0; shard < shardCount; shard++) {
+            BlobContainer shardCont = shardContainer(indexId, shard);
+            BlobStoreIndexShardSnapshot shardSnapshot = BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.read(
+                null, shardCont, snapshotId.getUUID(), NamedXContentRegistry.EMPTY
+            );
+            shardSnapshots.add(new ShardSnapshot(shard, shardSnapshot));
+        }
+
+        return new ResolvedIndex(snapshotId, indexId, indexMetadata, shardSnapshots);
+    }
+
+    private static boolean wildcardMatch(String text, String pattern) {
+        String regex = "^" + pattern.replace(".", "\\.").replace("*", ".*") + "$";
+        return text.matches(regex);
+    }
+
     public record ShardSnapshot(int shardId, BlobStoreIndexShardSnapshot snapshot) {}
 
     public record ResolvedIndex(SnapshotId snapshotId, IndexId indexId, IndexMetadata indexMetadata, List<ShardSnapshot> shardSnapshots) {}

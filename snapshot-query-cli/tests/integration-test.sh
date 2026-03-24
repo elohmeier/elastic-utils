@@ -2,15 +2,16 @@
 #
 # Integration test for elasticsearch-snapshot-query CLI (standalone JAR).
 #
-# Spins up MinIO (S3-compatible) and Elasticsearch via podman,
+# Spins up MinIO (S3-compatible) and Elasticsearch via docker,
 # indexes test documents, creates a snapshot to MinIO, stops ES,
 # then queries the snapshot offline using the standalone JAR.
 #
 # Prerequisites:
-#   - podman
+#   - docker
 #   - curl
 #   - jq
 #   - Java 21+
+#   - zstd (for compression tests)
 #
 # Usage:
 #   ./integration-test.sh [--skip-build] [--jar path/to/cli.jar]
@@ -37,6 +38,7 @@ ES_VERSION="9.0.3"
 SNAPSHOT_REPO="test-repo"
 SNAPSHOT_NAME="test-snap"
 INDEX_NAME="test-logs"
+ALIAS_NAME="test-logs-alias"
 
 SKIP_BUILD=false
 JAR_PATH=""
@@ -73,13 +75,13 @@ es_api() {
 
 cleanup() {
     log "Cleaning up..."
-    if podman container exists "$ES_CONTAINER" 2>/dev/null; then
+    if docker container inspect "$ES_CONTAINER" >/dev/null 2>&1; then
         log "Stopping Elasticsearch container"
-        podman rm -f "$ES_CONTAINER" >/dev/null 2>&1 || true
+        docker rm -f "$ES_CONTAINER" >/dev/null 2>&1 || true
     fi
-    if podman container exists "$MINIO_CONTAINER" 2>/dev/null; then
+    if docker container inspect "$MINIO_CONTAINER" >/dev/null 2>&1; then
         log "Stopping MinIO container"
-        podman rm -f "$MINIO_CONTAINER" >/dev/null 2>&1 || true
+        docker rm -f "$MINIO_CONTAINER" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
@@ -98,7 +100,7 @@ done
 # ── Step 1: Build the standalone JAR ─────────────────────────────────────────
 
 if [ -z "$JAR_PATH" ]; then
-    JAR_PATH="$PROJECT_ROOT/build/libs/elasticsearch-snapshot-query-cli-0.1.0.jar"
+    JAR_PATH="$PROJECT_ROOT/build/libs/elasticsearch-snapshot-query-cli-1.0.0.jar"
 fi
 
 if [ "$SKIP_BUILD" = false ]; then
@@ -112,10 +114,10 @@ log "Using JAR: $JAR_PATH"
 
 # ── Step 2: Start MinIO ─────────────────────────────────────────────────────
 
-log "Starting MinIO via podman..."
-podman rm -f "$MINIO_CONTAINER" 2>/dev/null || true
+log "Starting MinIO via docker..."
+docker rm -f "$MINIO_CONTAINER" 2>/dev/null || true
 
-podman run -d \
+docker run -d \
     --name "$MINIO_CONTAINER" \
     -p "${MINIO_PORT}:9000" \
     -p "${MINIO_CONSOLE_PORT}:9001" \
@@ -134,47 +136,47 @@ if command -v mc &>/dev/null; then
     mc alias set testminio "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" --api S3v4 >/dev/null
     mc mb "testminio/${MINIO_BUCKET}" 2>/dev/null || true
 else
-    podman exec "$MINIO_CONTAINER" \
+    docker exec "$MINIO_CONTAINER" \
         mc alias set local http://localhost:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1
-    podman exec "$MINIO_CONTAINER" \
+    docker exec "$MINIO_CONTAINER" \
         mc mb "local/${MINIO_BUCKET}" 2>/dev/null || true
 fi
 
 # ── Step 3: Start Elasticsearch (containerized) ─────────────────────────────
 
-log "Starting Elasticsearch ${ES_VERSION} via podman..."
-podman rm -f "$ES_CONTAINER" 2>/dev/null || true
+log "Starting Elasticsearch ${ES_VERSION} via docker..."
+docker rm -f "$ES_CONTAINER" 2>/dev/null || true
 
-podman run -d \
+docker run -d \
     --name "$ES_CONTAINER" \
     -p "${ES_HTTP_PORT}:9200" \
     -e "discovery.type=single-node" \
     -e "xpack.security.enabled=false" \
     -e "xpack.ml.enabled=false" \
     -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
-    -e "s3.client.default.endpoint=http://host.containers.internal:${MINIO_PORT}" \
+    -e "s3.client.default.endpoint=http://host.docker.internal:${MINIO_PORT}" \
     -e "s3.client.default.region=us-east-1" \
     -e "s3.client.default.path_style_access=true" \
-    docker.io/elasticsearch/elasticsearch:${ES_VERSION}
+    docker.elastic.co/elasticsearch/elasticsearch:${ES_VERSION}
 
 log "Waiting for Elasticsearch to be ready..."
 wait_for_url "http://localhost:${ES_HTTP_PORT}/_cluster/health" 120 || die "Elasticsearch failed to start"
 
 # Install repository-s3 plugin and set credentials via keystore
 log "Installing repository-s3 plugin..."
-podman exec "$ES_CONTAINER" bash -c \
+docker exec "$ES_CONTAINER" bash -c \
     'if ! bin/elasticsearch-plugin list | grep -q repository-s3; then
         bin/elasticsearch-plugin install --batch repository-s3
     fi'
 
 # Set S3 credentials in keystore
-podman exec "$ES_CONTAINER" bash -c \
+docker exec "$ES_CONTAINER" bash -c \
     "echo '${MINIO_ROOT_USER}' | bin/elasticsearch-keystore add -xf s3.client.default.access_key && \
      echo '${MINIO_ROOT_PASSWORD}' | bin/elasticsearch-keystore add -xf s3.client.default.secret_key"
 
 # Restart ES to pick up the plugin and keystore
 log "Restarting Elasticsearch to load repository-s3 plugin..."
-podman restart "$ES_CONTAINER"
+docker restart "$ES_CONTAINER"
 wait_for_url "http://localhost:${ES_HTTP_PORT}/_cluster/health" 120 || die "Elasticsearch failed to restart"
 log "Elasticsearch is ready"
 
@@ -192,34 +194,42 @@ es_api PUT "/${INDEX_NAME}" -d '{
       "message":   { "type": "text" },
       "level":     { "type": "keyword" },
       "status":    { "type": "keyword" },
-      "timestamp": { "type": "date" },
+      "@timestamp": { "type": "date" },
       "count":     { "type": "long" },
       "host":      { "type": "keyword" }
     }
   }
 }' | jq -r '.acknowledged' || die "Failed to create index"
 
+# Add alias
+log "Adding alias [${ALIAS_NAME}] to index [${INDEX_NAME}]..."
+es_api POST "/_aliases" -d "{
+  \"actions\": [
+    { \"add\": { \"index\": \"${INDEX_NAME}\", \"alias\": \"${ALIAS_NAME}\" } }
+  ]
+}" | jq -r '.acknowledged' || die "Failed to add alias"
+
 es_api POST "/_bulk" -d '
 {"index":{"_index":"test-logs","_id":"1"}}
-{"message":"Server started successfully","level":"info","status":"ok","timestamp":"2024-01-15T10:00:00Z","count":1,"host":"web-01"}
+{"message":"Server started successfully","level":"info","status":"ok","@timestamp":"2024-01-15T10:00:00Z","count":1,"host":"web-01"}
 {"index":{"_index":"test-logs","_id":"2"}}
-{"message":"Connection timeout to database","level":"error","status":"error","timestamp":"2024-01-15T10:01:00Z","count":3,"host":"web-01"}
+{"message":"Connection timeout to database","level":"error","status":"error","@timestamp":"2024-01-15T10:01:00Z","count":3,"host":"web-01"}
 {"index":{"_index":"test-logs","_id":"3"}}
-{"message":"Request processed in 250ms","level":"info","status":"ok","timestamp":"2024-01-15T10:02:00Z","count":42,"host":"web-02"}
+{"message":"Request processed in 250ms","level":"info","status":"ok","@timestamp":"2024-01-16T10:02:00Z","count":42,"host":"web-02"}
 {"index":{"_index":"test-logs","_id":"4"}}
-{"message":"Disk usage above 90%","level":"warn","status":"warning","timestamp":"2024-01-15T10:03:00Z","count":1,"host":"web-03"}
+{"message":"Disk usage above 90%","level":"warn","status":"warning","@timestamp":"2024-01-16T10:03:00Z","count":1,"host":"web-03"}
 {"index":{"_index":"test-logs","_id":"5"}}
-{"message":"Authentication failed for user admin","level":"error","status":"error","timestamp":"2024-01-15T10:04:00Z","count":5,"host":"web-02"}
+{"message":"Authentication failed for user admin","level":"error","status":"error","@timestamp":"2024-01-17T10:04:00Z","count":5,"host":"web-02"}
 {"index":{"_index":"test-logs","_id":"6"}}
-{"message":"Cache cleared","level":"info","status":"ok","timestamp":"2024-01-15T10:05:00Z","count":1,"host":"web-01"}
+{"message":"Cache cleared","level":"info","status":"ok","@timestamp":"2024-01-17T10:05:00Z","count":1,"host":"web-01"}
 {"index":{"_index":"test-logs","_id":"7"}}
-{"message":"Out of memory error","level":"error","status":"error","timestamp":"2024-01-15T10:06:00Z","count":1,"host":"web-03"}
+{"message":"Out of memory error","level":"error","status":"error","@timestamp":"2024-01-18T10:06:00Z","count":1,"host":"web-03"}
 {"index":{"_index":"test-logs","_id":"8"}}
-{"message":"Backup completed","level":"info","status":"ok","timestamp":"2024-01-15T10:07:00Z","count":1,"host":"web-01"}
+{"message":"Backup completed","level":"info","status":"ok","@timestamp":"2024-01-18T10:07:00Z","count":1,"host":"web-01"}
 {"index":{"_index":"test-logs","_id":"9"}}
-{"message":"SSL certificate expiring soon","level":"warn","status":"warning","timestamp":"2024-01-15T10:08:00Z","count":2,"host":"web-02"}
+{"message":"SSL certificate expiring soon","level":"warn","status":"warning","@timestamp":"2024-01-19T10:08:00Z","count":2,"host":"web-02"}
 {"index":{"_index":"test-logs","_id":"10"}}
-{"message":"New deployment rolled out","level":"info","status":"ok","timestamp":"2024-01-15T10:09:00Z","count":1,"host":"web-03"}
+{"message":"New deployment rolled out","level":"info","status":"ok","@timestamp":"2024-01-19T10:09:00Z","count":1,"host":"web-03"}
 ' | jq -r '.errors' || die "Failed to bulk index"
 
 es_api POST "/${INDEX_NAME}/_flush" >/dev/null 2>&1 || true
@@ -257,10 +267,10 @@ log "Snapshot state: ${SNAP_STATE}"
 # ── Step 6: Stop Elasticsearch ───────────────────────────────────────────────
 
 log "Stopping Elasticsearch..."
-podman stop "$ES_CONTAINER" >/dev/null 2>&1 || true
+docker stop "$ES_CONTAINER" >/dev/null 2>&1 || true
 log "Elasticsearch stopped — now querying snapshot offline"
 
-# ── Step 7: Run CLI queries against the snapshot ─────────────────────────────
+# ── Step 7: Run CLI query tests against the snapshot ──────────────────────────
 
 log ""
 log "============================================"
@@ -270,19 +280,23 @@ log ""
 
 JAVA="${JAVA_HOME:+${JAVA_HOME}/bin/}java"
 
+CLI_COMMON_ARGS=(
+    --bucket "$MINIO_BUCKET"
+    --endpoint "$MINIO_ENDPOINT"
+    --region us-east-1
+    --access-key "$MINIO_ROOT_USER"
+    --secret-key "$MINIO_ROOT_PASSWORD"
+    --snapshot "$SNAPSHOT_NAME"
+    --index "$INDEX_NAME"
+)
+
 run_query() {
     local desc="$1" query="$2"
     shift 2
     echo -e "\033[1;34m==>\033[0m Test: ${desc}" >&2
     local raw_output json_output
-    raw_output=$("$JAVA" -jar "$JAR_PATH" \
-        --bucket "$MINIO_BUCKET" \
-        --endpoint "$MINIO_ENDPOINT" \
-        --region us-east-1 \
-        --access-key "$MINIO_ROOT_USER" \
-        --secret-key "$MINIO_ROOT_PASSWORD" \
-        --snapshot "$SNAPSHOT_NAME" \
-        --index "$INDEX_NAME" \
+    raw_output=$("$JAVA" -jar "$JAR_PATH" query \
+        "${CLI_COMMON_ARGS[@]}" \
         --query "$query" \
         "$@" 2>/dev/null) || true
     json_output=$(echo "$raw_output" | awk '
@@ -377,6 +391,259 @@ if echo "$OUTPUT" | jq -e '.hits.hits[0]._source.message' >/dev/null 2>&1; then
     ok "_source present: documents include _source with message field"
 else
     fail "_source present: _source or message field missing"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Export tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+log ""
+log "============================================"
+log "  Running snapshot-export CLI tests"
+log "============================================"
+log ""
+
+EXPORT_DIR=$(mktemp -d)
+trap 'rm -rf "$EXPORT_DIR"; cleanup' EXIT
+
+EXPORT_COMMON_ARGS=(
+    --bucket "$MINIO_BUCKET"
+    --endpoint "$MINIO_ENDPOINT"
+    --region us-east-1
+    --access-key "$MINIO_ROOT_USER"
+    --secret-key "$MINIO_ROOT_PASSWORD"
+    --snapshot "$SNAPSHOT_NAME"
+)
+
+run_export() {
+    local desc="$1"
+    shift
+    echo -e "\033[1;34m==>\033[0m Export test: ${desc}" >&2
+    "$JAVA" -jar "$JAR_PATH" export \
+        "${EXPORT_COMMON_ARGS[@]}" \
+        "$@" 2>/dev/null
+}
+
+# ── Export Test 1: basic JSONL export ─────────────────────────────────────────
+
+OUTFILE="$EXPORT_DIR/basic-export.jsonl"
+run_export "basic JSONL export (match_all)" \
+    --index "$INDEX_NAME" \
+    --query '{"match_all":{}}' \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    if [ "$LINE_COUNT" = "10" ]; then
+        ok "basic export: got ${LINE_COUNT} lines (expected 10)"
+    else
+        fail "basic export: got ${LINE_COUNT} lines (expected 10)"
+    fi
+    # Verify each line is valid JSON
+    INVALID_LINES=$(while IFS= read -r line; do echo "$line" | jq empty 2>&1 && true || echo "invalid"; done < "$OUTFILE" | grep -c "invalid" || true)
+    if [ "$INVALID_LINES" = "0" ]; then
+        ok "basic export: all lines are valid JSON"
+    else
+        fail "basic export: ${INVALID_LINES} lines are invalid JSON"
+    fi
+else
+    fail "basic export: output file not created"
+fi
+
+# ── Export Test 2: date range filtering ───────────────────────────────────────
+
+OUTFILE="$EXPORT_DIR/date-range-export.jsonl"
+run_export "date range filter (2024-01-16 to 2024-01-18)" \
+    --index "$INDEX_NAME" \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-16 \
+    --to-date 2024-01-18 \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    # Docs 3,4 (Jan 16), 5,6 (Jan 17) = 4 docs. Jan 18 excluded (to-date is exclusive).
+    if [ "$LINE_COUNT" = "4" ]; then
+        ok "date range export: got ${LINE_COUNT} lines (expected 4)"
+    else
+        fail "date range export: got ${LINE_COUNT} lines (expected 4)"
+        cat "$OUTFILE" >&2
+    fi
+else
+    fail "date range export: output file not created"
+fi
+
+# ── Export Test 3: zstd compression ──────────────────────────────────────────
+
+OUTFILE="$EXPORT_DIR/compressed-export.jsonl.zst"
+run_export "zstd compressed export" \
+    --index "$INDEX_NAME" \
+    --query '{"match_all":{}}' \
+    --compression zstd \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    if command -v zstd &>/dev/null; then
+        DECOMPRESSED=$(zstd -d -c "$OUTFILE")
+        LINE_COUNT=$(echo "$DECOMPRESSED" | wc -l | tr -d ' ')
+        if [ "$LINE_COUNT" = "10" ]; then
+            ok "zstd export: decompressed to ${LINE_COUNT} lines (expected 10)"
+        else
+            fail "zstd export: decompressed to ${LINE_COUNT} lines (expected 10)"
+        fi
+    else
+        # Check it's not plaintext JSON (zstd magic bytes: 0x28 0xB5 0x2F 0xFD)
+        MAGIC=$(xxd -l 4 "$OUTFILE" | head -1)
+        if echo "$MAGIC" | grep -q "28b5 2ffd"; then
+            ok "zstd export: file has zstd magic bytes"
+        else
+            fail "zstd export: file does not appear to be zstd compressed"
+        fi
+    fi
+else
+    fail "zstd export: output file not created"
+fi
+
+# ── Export Test 4: _source field filtering via query-file ─────────────────────
+
+QUERY_FILE="$EXPORT_DIR/filtered-query.json"
+cat > "$QUERY_FILE" << 'QUERYEOF'
+{
+  "query": {
+    "match_all": {}
+  },
+  "_source": ["@timestamp", "level", "host"]
+}
+QUERYEOF
+
+OUTFILE="$EXPORT_DIR/filtered-export.jsonl"
+run_export "_source field filtering" \
+    --index "$INDEX_NAME" \
+    --query-file "$QUERY_FILE" \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    if [ "$LINE_COUNT" = "10" ]; then
+        ok "_source filtering: got ${LINE_COUNT} lines (expected 10)"
+    else
+        fail "_source filtering: got ${LINE_COUNT} lines (expected 10)"
+    fi
+    # Check that only requested fields are present
+    FIRST_LINE=$(head -1 "$OUTFILE")
+    HAS_MESSAGE=$(echo "$FIRST_LINE" | jq 'has("message")' 2>/dev/null || echo "error")
+    HAS_TIMESTAMP=$(echo "$FIRST_LINE" | jq 'has("@timestamp")' 2>/dev/null || echo "error")
+    HAS_LEVEL=$(echo "$FIRST_LINE" | jq 'has("level")' 2>/dev/null || echo "error")
+    if [ "$HAS_MESSAGE" = "false" ] && [ "$HAS_TIMESTAMP" = "true" ] && [ "$HAS_LEVEL" = "true" ]; then
+        ok "_source filtering: only requested fields present"
+    else
+        fail "_source filtering: unexpected fields (message=$HAS_MESSAGE, @timestamp=$HAS_TIMESTAMP, level=$HAS_LEVEL)"
+        echo "    First line: $FIRST_LINE"
+    fi
+else
+    fail "_source filtering: output file not created"
+fi
+
+# ── Export Test 5: alias resolution ──────────────────────────────────────────
+
+OUTFILE="$EXPORT_DIR/alias-export.jsonl"
+run_export "alias resolution" \
+    --index "$ALIAS_NAME" \
+    --query '{"match_all":{}}' \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    if [ "$LINE_COUNT" = "10" ]; then
+        ok "alias export: got ${LINE_COUNT} lines via alias (expected 10)"
+    else
+        fail "alias export: got ${LINE_COUNT} lines via alias (expected 10)"
+    fi
+else
+    fail "alias export: output file not created"
+fi
+
+# ── Export Test 6: combined date range + term filter ─────────────────────────
+
+OUTFILE="$EXPORT_DIR/combined-export.jsonl"
+run_export "combined date range + term filter" \
+    --index "$INDEX_NAME" \
+    --query '{"term":{"level":"error"}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-18 \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    # error docs in range: id 2 (Jan 15), id 5 (Jan 17) = 2 docs. Jan 18 excluded.
+    if [ "$LINE_COUNT" = "2" ]; then
+        ok "combined filter: got ${LINE_COUNT} lines (expected 2)"
+    else
+        fail "combined filter: got ${LINE_COUNT} lines (expected 2)"
+        cat "$OUTFILE" >&2
+    fi
+else
+    fail "combined filter: output file not created"
+fi
+
+# ── Export Test 7: full search body with sort and date range ──────────────────
+
+QUERY_FILE="$EXPORT_DIR/full-body-query.json"
+cat > "$QUERY_FILE" << 'QUERYEOF'
+{
+  "sort": [
+    { "@timestamp": "asc" }
+  ],
+  "track_total_hits": true,
+  "_source": ["@timestamp", "message", "level"],
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "terms": {
+            "level": ["info", "warn"]
+          }
+        }
+      ]
+    }
+  }
+}
+QUERYEOF
+
+OUTFILE="$EXPORT_DIR/full-body-export.jsonl"
+run_export "full search body (sort + _source + query)" \
+    --index "$INDEX_NAME" \
+    --query-file "$QUERY_FILE" \
+    --from-date 2024-01-16 \
+    --to-date 2024-01-20 \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    # info+warn from Jan 16-19: id 3(info,Jan16), 4(warn,Jan16), 6(info,Jan17), 8(info,Jan18), 9(warn,Jan19), 10(info,Jan19) = 6
+    if [ "$LINE_COUNT" = "6" ]; then
+        ok "full body export: got ${LINE_COUNT} lines (expected 6)"
+    else
+        fail "full body export: got ${LINE_COUNT} lines (expected 6)"
+        cat "$OUTFILE" >&2
+    fi
+    # Verify sort order: first timestamp should be earliest
+    FIRST_TS=$(head -1 "$OUTFILE" | jq -r '.["@timestamp"]' 2>/dev/null || echo "error")
+    LAST_TS=$(tail -1 "$OUTFILE" | jq -r '.["@timestamp"]' 2>/dev/null || echo "error")
+    if [[ "$FIRST_TS" < "$LAST_TS" ]] || [[ "$FIRST_TS" = "$LAST_TS" ]]; then
+        ok "full body export: results sorted by @timestamp ascending"
+    else
+        fail "full body export: results not sorted (first=$FIRST_TS, last=$LAST_TS)"
+    fi
+    # Verify _source filtering
+    HAS_COUNT=$(head -1 "$OUTFILE" | jq 'has("count")' 2>/dev/null || echo "error")
+    if [ "$HAS_COUNT" = "false" ]; then
+        ok "full body export: _source filtering applied (no 'count' field)"
+    else
+        fail "full body export: _source filtering not applied (count field present)"
+    fi
+else
+    fail "full body export: output file not created"
 fi
 
 # ── Results ──────────────────────────────────────────────────────────────────
