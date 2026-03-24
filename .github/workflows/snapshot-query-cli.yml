@@ -6,23 +6,19 @@ on:
     paths:
       - "snapshot-query-cli/**"
       - ".github/workflows/snapshot-query-cli.yml"
-    tags:
-      - "snapshot-query-cli-v*"
   pull_request:
     paths:
       - "snapshot-query-cli/**"
       - ".github/workflows/snapshot-query-cli.yml"
 
-permissions:
-  contents: write
-
-defaults:
-  run:
-    working-directory: snapshot-query-cli
+permissions: read-all
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: snapshot-query-cli
     steps:
       - uses: actions/checkout@v4
 
@@ -37,25 +33,58 @@ jobs:
         run: ./gradlew shadowJar
 
       - name: Verify JAR runs
-        run: java -jar build/libs/elasticsearch-snapshot-query-cli-0.1.0.jar --help
-
-      - name: Upload JAR artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: elasticsearch-snapshot-query-cli
-          path: snapshot-query-cli/build/libs/elasticsearch-snapshot-query-cli-0.1.0.jar
+        run: java -jar build/libs/elasticsearch-snapshot-query-cli-*.jar --help
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/snapshot-query-cli-v')
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: snapshot-query-cli
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          name: elasticsearch-snapshot-query-cli
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Create GitHub Release
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          npx --yes
+          -p semantic-release@25
+          -p @semantic-release/exec@7
+          -p @semantic-release/git@10
+          -p @semantic-release/github@12
+          -p @semantic-release/commit-analyzer@13
+          -p @semantic-release/release-notes-generator@14
+          semantic-release
+
+      - name: Build release JAR
+        if: steps.semantic.outputs.released == 'true'
+        run: ./gradlew shadowJar
+
+      - name: Attach JAR to GitHub release
+        if: steps.semantic.outputs.released == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: elasticsearch-snapshot-query-cli-0.1.0.jar
-          generate_release_notes: true
+          tag_name: snapshot-query-cli-v${{ steps.semantic.outputs.version }}
+          files: snapshot-query-cli/build/libs/elasticsearch-snapshot-query-cli-*.jar
