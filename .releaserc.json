@@ -1,0 +1,22 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "sed -i 's/^version = \".*\"/version = \"${nextRelease.version}\"/' pyproject.toml && sed -i \"s/^version = .*/version = '${nextRelease.version}'/\" snapshot-query-cli/build.gradle && uv lock",
+        "successCmd": "echo \"released=true\" >> $GITHUB_OUTPUT && echo \"version=${nextRelease.version}\" >> $GITHUB_OUTPUT"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["pyproject.toml", "uv.lock", "snapshot-query-cli/build.gradle"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    "@semantic-release/github"
+  ]
+}

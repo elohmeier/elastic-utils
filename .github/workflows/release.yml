@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    branches: ["main"]
+
+permissions: read-all
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run semantic-release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          npx --yes
+          -p semantic-release@25
+          -p @semantic-release/exec@7
+          -p @semantic-release/git@10
+          -p @semantic-release/github@12
+          -p @semantic-release/commit-analyzer@13
+          -p @semantic-release/release-notes-generator@14
+          semantic-release
+
+      - name: Build snapshot-query-cli JAR
+        if: steps.semantic.outputs.released == 'true'
+        working-directory: snapshot-query-cli
+        run: ./gradlew shadowJar -PcliVersion=${{ steps.semantic.outputs.version }}
+
+      - name: Attach JAR to GitHub release
+        if: steps.semantic.outputs.released == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.semantic.outputs.version }}
+          files: snapshot-query-cli/build/libs/elasticsearch-snapshot-query-cli-${{ steps.semantic.outputs.version }}.jar
