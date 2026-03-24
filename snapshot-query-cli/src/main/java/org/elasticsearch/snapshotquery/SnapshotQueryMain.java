@@ -25,6 +25,8 @@ public class SnapshotQueryMain extends MultiCommand {
     }
 
     public static void main(String[] args) throws Exception {
+        configureBootstrapLogging();
+
         // Initialize a no-op LoggerFactory to prevent NPE in Command.mainWithoutErrorHandling
         if (LoggerFactory.provider() == null) {
             Logger noopLogger = (Logger) Proxy.newProxyInstance(
@@ -47,5 +49,16 @@ public class SnapshotQueryMain extends MultiCommand {
 
         var command = new SnapshotQueryMain();
         command.main(args, Terminal.DEFAULT, ProcessInfo.fromSystem());
+    }
+
+    private static void configureBootstrapLogging() {
+        // Log4j may initialize its simple/status logger before the real config is applied.
+        // Force a minimal bootstrap format so Elasticsearch/Log4j startup does not try to
+        // interpret a full logging pattern as a date-time format.
+        System.setProperty("org.apache.logging.log4j.simplelog.showdatetime", "false");
+        System.setProperty("org.apache.logging.log4j.simplelog.showContextMap", "false");
+        System.setProperty("org.apache.logging.log4j.simplelog.showlogname", "false");
+        System.setProperty("org.apache.logging.log4j.simplelog.showShortLogname", "true");
+        System.setProperty("org.apache.logging.log4j.simplelog.level", "ERROR");
     }
 }

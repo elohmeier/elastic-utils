@@ -139,7 +139,7 @@ public class SnapshotQueryDirectory extends BaseDirectory {
      */
     static class S3IndexInput extends BufferedIndexInput {
         private static final int DEFAULT_READ_AHEAD_BYTES = 1024 * 1024;
-        private static final int STORED_FIELDS_READ_AHEAD_BYTES = 4 * 1024 * 1024;
+        private static final int STORED_FIELDS_READ_AHEAD_BYTES = 1024 * 1024;
         private static final int DOC_VALUES_READ_AHEAD_BYTES = 2 * 1024 * 1024;
         private static final long DEFAULT_FULL_CACHE_BYTES = 4L * 1024 * 1024;
         private static final long LARGE_METADATA_FULL_CACHE_BYTES = 16L * 1024 * 1024;
