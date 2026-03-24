@@ -1,0 +1,61 @@
+name: Snapshot Query CLI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "snapshot-query-cli/**"
+      - ".github/workflows/snapshot-query-cli.yml"
+    tags:
+      - "snapshot-query-cli-v*"
+  pull_request:
+    paths:
+      - "snapshot-query-cli/**"
+      - ".github/workflows/snapshot-query-cli.yml"
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    working-directory: snapshot-query-cli
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build shadow JAR
+        run: ./gradlew shadowJar
+
+      - name: Verify JAR runs
+        run: java -jar build/libs/elasticsearch-snapshot-query-cli-0.1.0.jar --help
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: elasticsearch-snapshot-query-cli
+          path: snapshot-query-cli/build/libs/elasticsearch-snapshot-query-cli-0.1.0.jar
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/snapshot-query-cli-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: elasticsearch-snapshot-query-cli
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: elasticsearch-snapshot-query-cli-0.1.0.jar
+          generate_release_notes: true

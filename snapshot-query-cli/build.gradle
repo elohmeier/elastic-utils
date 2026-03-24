@@ -1,0 +1,69 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '9.0.0-beta12'
+}
+
+group = 'de.nerdworks'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+ext {
+    esVersion = '9.0.3'
+    awsSdkVersion = '2.31.78'
+    luceneVersion = '10.1.0'  // ES 9.0.x bundles Lucene 10.1.0
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Elasticsearch server (BlobContainer, RepositoryData, IndexMetadata, etc.)
+    implementation "org.elasticsearch:elasticsearch:${esVersion}"
+
+    // Elasticsearch CLI framework
+    implementation "org.elasticsearch:elasticsearch-cli:${esVersion}"
+
+    // Elasticsearch x-content (XContentParser, XContentBuilder)
+    implementation "org.elasticsearch:elasticsearch-x-content:${esVersion}"
+
+    // Apache Lucene
+    implementation "org.apache.lucene:lucene-core:${luceneVersion}"
+
+    // AWS SDK for direct S3 access
+    implementation "software.amazon.awssdk:s3:${awsSdkVersion}"
+    implementation "software.amazon.awssdk:auth:${awsSdkVersion}"
+    implementation "software.amazon.awssdk:regions:${awsSdkVersion}"
+    implementation "software.amazon.awssdk:apache-client:${awsSdkVersion}"
+
+    // Logging
+    runtimeOnly "org.apache.logging.log4j:log4j-api:2.19.0"
+    runtimeOnly "org.apache.logging.log4j:log4j-core:2.19.0"
+    runtimeOnly "org.apache.logging.log4j:log4j-slf4j2-impl:2.19.0"
+}
+
+shadowJar {
+    archiveBaseName.set('elasticsearch-snapshot-query-cli')
+    archiveClassifier.set('')
+    mergeServiceFiles()
+
+    manifest {
+        attributes(
+            'Main-Class': 'org.elasticsearch.snapshotquery.SnapshotQueryMain'
+        )
+    }
+}
+
+tasks.named('build') {
+    dependsOn shadowJar
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs.addAll(['--add-exports', 'java.base/sun.security.provider=ALL-UNNAMED'])
+}
