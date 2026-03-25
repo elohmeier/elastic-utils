@@ -71,45 +71,58 @@ public class SnapshotExportCli extends Command {
         Sort sort = searchBody.sort();
         List<String> sourceFields = searchBody.sourceFields();
 
-        ProfilingRecorder profilingRecorder = profileFile != null ? new ProfilingRecorder() : null;
+        ProfilingRecorder profilingRecorder = new ProfilingRecorder();
 
         terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
 
         try (
             S3ClientFactory.S3Access s3Access = s3Options.connect(options, profilingRecorder);
-            OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)
+            OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression);
+            ProgressReporter progressReporter = new ProgressReporter(terminal, profilingRecorder)
         ) {
             BlobContainer rootContainer = s3Access.rootContainer();
             SnapshotMetadataLoader metadataLoader = new SnapshotMetadataLoader(rootContainer, s3Access);
 
             // Auto-discover snapshot if not specified
             if (snapshotName == null) {
+                progressReporter.clearLine();
                 terminal.errorPrintln("No snapshot specified, searching for snapshots containing [" + indexNameOrAlias + "]...");
                 java.util.List<String> candidates = metadataLoader.findSnapshotsForIndex(indexNameOrAlias);
                 if (candidates.isEmpty()) {
                     throw new UserException(ExitCodes.CONFIG, "No snapshots found containing index/alias [" + indexNameOrAlias + "]");
                 }
                 snapshotName = candidates.get(0); // newest first
+                progressReporter.clearLine();
                 terminal.errorPrintln("Auto-selected snapshot: " + snapshotName);
                 if (candidates.size() > 1) {
+                    progressReporter.clearLine();
                     terminal.errorPrintln("  (other candidates: " + String.join(", ", candidates.subList(1, Math.min(5, candidates.size())))
                         + (candidates.size() > 5 ? " ..." : "") + ")");
                 }
             }
 
+            progressReporter.clearLine();
             terminal.errorPrintln("Snapshot: " + snapshotName + ", Index: " + indexNameOrAlias);
             if (fromDate != null || toDate != null) {
+                progressReporter.clearLine();
                 terminal.errorPrintln("Date range: " + (fromDate != null ? fromDate : "*") + " to " + (toDate != null ? toDate : "*"));
             }
 
             // Resolve index (supports aliases and patterns)
+            profilingRecorder.setCurrentStage("resolving");
+            progressReporter.clearLine();
             terminal.errorPrintln("Resolving indices...");
             List<SnapshotMetadataLoader.ResolvedIndex> resolvedIndices = metadataLoader.resolveIndices(snapshotName, indexNameOrAlias);
+            profilingRecorder.setTargetTotals(0, resolvedIndices.size());
+            progressReporter.clearLine();
             terminal.errorPrintln("Found " + resolvedIndices.size() + " index/indices");
 
             long totalExported = 0;
+            int current = 0;
 
             for (SnapshotMetadataLoader.ResolvedIndex resolved : resolvedIndices) {
+                current++;
+                profilingRecorder.startTarget(snapshotName, resolved.indexId().getName(), current - 1, resolvedIndices.size());
                 totalExported += SnapshotExportSupport.exportResolvedIndex(
                     terminal,
                     metadataLoader,
@@ -120,16 +133,19 @@ public class SnapshotExportCli extends Command {
                     batchSize,
                     out,
                     startTime,
-                    profilingRecorder
+                    profilingRecorder,
+                    progressReporter
                 );
+                profilingRecorder.finishTarget(current, resolvedIndices.size());
             }
 
             out.flush();
             long tookMs = System.currentTimeMillis() - startTime;
+            progressReporter.clearLine();
             terminal.errorPrintln("Export complete: " + totalExported + " documents in " + (tookMs / 1000) + "s");
         }
 
-        if (profilingRecorder != null) {
+        if (profileFile != null) {
             profilingRecorder.markCompleted();
             writeProfileFile(profileFile, profilingRecorder);
             terminal.errorPrintln("Profile written to " + profileFile);

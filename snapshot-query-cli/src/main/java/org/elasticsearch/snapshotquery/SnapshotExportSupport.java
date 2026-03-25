@@ -48,8 +48,27 @@ final class SnapshotExportSupport {
         long startTimeMillis,
         ProfilingRecorder profilingRecorder
     ) throws IOException {
+        return exportResolvedIndex(
+            terminal, metadataLoader, resolved, luceneQuery, sort, sourceFields, batchSize, out, startTimeMillis, profilingRecorder, null
+        );
+    }
+
+    static long exportResolvedIndex(
+        Terminal terminal,
+        SnapshotMetadataLoader metadataLoader,
+        SnapshotMetadataLoader.ResolvedIndex resolved,
+        Query luceneQuery,
+        Sort sort,
+        List<String> sourceFields,
+        int batchSize,
+        OutputStream out,
+        long startTimeMillis,
+        ProfilingRecorder profilingRecorder,
+        ProgressReporter progressReporter
+    ) throws IOException {
         String indexName = resolved.indexId().getName();
         int shardCount = resolved.shardSnapshots().size();
+        if (progressReporter != null) progressReporter.clearLine();
         terminal.errorPrintln("Processing index [" + indexName + "] with " + shardCount + " shard(s)...");
 
         long totalExported = 0;
@@ -73,15 +92,13 @@ final class SnapshotExportSupport {
                 }
                 IndexSearcher searcher = new IndexSearcher(reader);
                 long shardStartNanos = System.nanoTime();
-                long shardExported = exportShard(searcher, luceneQuery, sort, sourceFields, batchSize, out);
+                long shardExported = exportShard(searcher, luceneQuery, sort, sourceFields, batchSize, out, profilingRecorder, indexName, shardId);
                 long shardSearchNanos = System.nanoTime() - shardStartNanos;
                 long shardTookMs = shardSearchNanos / 1_000_000L;
                 totalExported += shardExported;
-                if (profilingRecorder != null) {
-                    profilingRecorder.recordShardSearch(indexName, shardId, shardExported, shardSearchNanos);
-                }
 
                 long elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000;
+                if (progressReporter != null) progressReporter.clearLine();
                 terminal.errorPrintln(
                     "  Shard " + shardId + ": exported " + shardExported
                         + " docs (index total: " + totalExported + ", open: " + (openNanos / 1_000_000L) + "ms, shard: "
@@ -118,7 +135,10 @@ final class SnapshotExportSupport {
         Sort sort,
         List<String> sourceFields,
         int batchSize,
-        OutputStream out
+        OutputStream out,
+        ProfilingRecorder profilingRecorder,
+        String indexName,
+        int shardId
     ) throws IOException {
         long exported = 0;
         ScoreDoc lastDoc = null;
@@ -126,6 +146,7 @@ final class SnapshotExportSupport {
 
         while (true) {
             TopDocs topDocs;
+            long batchStartNanos = System.nanoTime();
             if (lastDoc == null) {
                 topDocs = searcher.search(query, batchSize, sort);
             } else {
@@ -137,6 +158,7 @@ final class SnapshotExportSupport {
             }
 
             StoredFields storedFields = searcher.storedFields();
+            long batchExported = 0;
 
             for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
                 var doc = storedFields.document(scoreDoc.doc);
@@ -145,8 +167,13 @@ final class SnapshotExportSupport {
                     byte[] sourceBytes = filterSource(sourceField.bytes, sourceField.offset, sourceField.length, fieldSet);
                     out.write(sourceBytes);
                     out.write('\n');
-                    exported++;
+                    batchExported++;
                 }
+            }
+
+            exported += batchExported;
+            if (profilingRecorder != null && batchExported > 0) {
+                profilingRecorder.recordShardSearch(indexName, shardId, batchExported, System.nanoTime() - batchStartNanos);
             }
 
             lastDoc = topDocs.scoreDocs[topDocs.scoreDocs.length - 1];

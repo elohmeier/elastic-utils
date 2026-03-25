@@ -28,7 +28,6 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ExportRangeCli extends Command {
-    private static final long PROGRESS_INTERVAL_MS = 5000L;
 
     private final S3Options s3Options;
     private final OptionSpec<String> indexPatternOption;
@@ -130,6 +129,7 @@ public class ExportRangeCli extends Command {
                 current++;
                 profilingRecorder.startTarget(target.snapshotName(), target.indexName(), current - 1, targets.size());
                 String outputPath = buildOutputPath(outputDir, target, compression, allSnapshots, targets);
+                progressReporter.clearLine();
                 terminal.errorPrintln("[" + current + "/" + targets.size() + "] Exporting " + target.indexName() + " from " + target.snapshotName() + "...");
 
                 try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
@@ -147,7 +147,8 @@ public class ExportRangeCli extends Command {
                         batchSize,
                         out,
                         startTime,
-                        profilingRecorder
+                        profilingRecorder,
+                        progressReporter
                     );
                     out.flush();
                     profilingRecorder.recordIndexExport(
@@ -159,11 +160,13 @@ public class ExportRangeCli extends Command {
                     );
                     totalExported += exported;
                     profilingRecorder.finishTarget(current, targets.size());
+                    progressReporter.clearLine();
                     terminal.errorPrintln("  Index complete: " + exported + " docs -> " + outputPath);
                 }
             }
 
             long tookMs = System.currentTimeMillis() - startTime;
+            progressReporter.clearLine();
             terminal.errorPrintln("Export-range complete: " + totalExported + " documents in " + (tookMs / 1000) + "s");
             profileFileWriter.flushCompleted();
         }
@@ -292,61 +295,4 @@ public class ExportRangeCli extends Command {
         }
     }
 
-    private static final class ProgressReporter implements AutoCloseable {
-        private final AtomicBoolean running = new AtomicBoolean(true);
-        private final Thread thread;
-
-        private ProgressReporter(Terminal terminal, ProfilingRecorder profilingRecorder) {
-            this.thread = new Thread(() -> {
-                while (running.get()) {
-                    try {
-                        Thread.sleep(PROGRESS_INTERVAL_MS);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
-                    }
-                    if (!running.get()) {
-                        return;
-                    }
-
-                    String indexName = profilingRecorder.currentIndexName();
-                    String snapshotName = profilingRecorder.currentSnapshotName();
-                    int shardId = profilingRecorder.currentShardId();
-                    String shardText = shardId >= 0 ? " shard=" + shardId : "";
-                    terminal.errorPrintln(
-                        "Progress: "
-                            + profilingRecorder.completedTargets() + "/" + profilingRecorder.totalTargets()
-                            + " indices complete"
-                            + (indexName != null ? ", index=" + indexName : "")
-                            + (snapshotName != null ? ", snapshot=" + snapshotName : "")
-                            + shardText
-                            + ", stage=" + profilingRecorder.currentStage()
-                            + ", docs=" + profilingRecorder.totalDocsExported()
-                            + ", s3_bytes=" + humanBytes(profilingRecorder.s3BytesRead())
-                            + ", s3_calls(full/range)=" + profilingRecorder.s3ReadFullCalls() + "/" + profilingRecorder.s3ReadRangeCalls()
-                            + ", elapsed=" + (profilingRecorder.totalMillis() / 1000) + "s"
-                    );
-                }
-            }, "snapshot-export-progress");
-            this.thread.setDaemon(true);
-            this.thread.start();
-        }
-
-        @Override
-        public void close() {
-            running.set(false);
-            thread.interrupt();
-        }
-
-        private static String humanBytes(long bytes) {
-            double value = bytes;
-            String[] units = { "B", "KiB", "MiB", "GiB", "TiB" };
-            int unit = 0;
-            while (value >= 1024 && unit < units.length - 1) {
-                value /= 1024.0;
-                unit++;
-            }
-            return String.format(java.util.Locale.ROOT, "%.1f%s", value, units[unit]);
-        }
-    }
 }

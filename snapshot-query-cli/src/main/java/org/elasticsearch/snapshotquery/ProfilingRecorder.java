@@ -35,6 +35,7 @@ final class ProfilingRecorder {
     private final AtomicLong s3ReadRangeNanos = new AtomicLong();
     private final AtomicLong s3BytesRequested = new AtomicLong();
     private final AtomicLong s3BytesRead = new AtomicLong();
+    private final AtomicLong liveDocsExported = new AtomicLong();
 
     private final Map<String, IndexStats> indices = new ConcurrentHashMap<>();
     private final Map<String, LuceneFileStats> luceneFiles = new ConcurrentHashMap<>();
@@ -130,6 +131,7 @@ final class ProfilingRecorder {
         ShardStats shardStats = shardStats(indexName, shardId);
         shardStats.docsExported.addAndGet(docsExported);
         shardStats.searchNanos.addAndGet(nanos);
+        liveDocsExported.addAndGet(docsExported);
     }
 
     void recordLuceneFileRead(String indexName, int shardId, String fileName, long bytesRead, long nanos) {
@@ -236,7 +238,7 @@ final class ProfilingRecorder {
     }
 
     long totalDocsExported() {
-        return indices.values().stream().mapToLong(stats -> stats.docsExported.get()).sum();
+        return liveDocsExported.get();
     }
 
     String currentSnapshotName() {
