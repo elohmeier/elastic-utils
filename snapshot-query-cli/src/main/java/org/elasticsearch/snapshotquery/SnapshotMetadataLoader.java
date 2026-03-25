@@ -178,6 +178,11 @@ public class SnapshotMetadataLoader {
             String concreteIndexName = entry.getKey();
             IndexId indexId = entry.getValue();
 
+            // Skip indices not in this snapshot
+            if (!repositoryData.getSnapshots(indexId).contains(snapshotId)) {
+                continue;
+            }
+
             boolean matches = false;
             if (isWildcard) {
                 matches = wildcardMatch(concreteIndexName, indexNameOrAlias);
