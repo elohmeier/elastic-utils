@@ -32,19 +32,27 @@ final class ProgressReporter implements AutoCloseable {
                 }
 
                 int shardId = profilingRecorder.currentShardId();
-                String shardText = shardId >= 0 ? " shard=" + shardId : "";
+                int totalShards = profilingRecorder.currentTotalShards();
+                String shardText = shardId >= 0 ? " shard " + (shardId + 1) + "/" + totalShards : "";
                 String stage = profilingRecorder.currentStage();
                 long docs = profilingRecorder.totalDocsExported();
                 long s3Bytes = profilingRecorder.s3BytesRead();
                 long s3Calls = profilingRecorder.s3ReadFullCalls() + profilingRecorder.s3ReadRangeCalls();
-                long elapsed = profilingRecorder.totalMillis() / 1000;
+                long elapsedMs = profilingRecorder.totalMillis();
+                long elapsed = elapsedMs / 1000;
+
+                long totalHits = profilingRecorder.currentShardTotalHits();
+                String hitsText = totalHits >= 0 ? " (" + formatNumber(totalHits) + " hits)" : "";
+
+                double docsPerSec = elapsedMs > 0 ? docs * 1000.0 / elapsedMs : 0;
+                double bytesPerSec = elapsedMs > 0 ? s3Bytes * 1000.0 / elapsedMs : 0;
 
                 String line = profilingRecorder.completedTargets() + "/" + profilingRecorder.totalTargets()
                     + " indices"
                     + shardText
                     + " | " + stage
-                    + " | " + formatNumber(docs) + " docs"
-                    + " | " + humanBytes(s3Bytes) + " from S3"
+                    + " | " + formatNumber(docs) + " docs" + hitsText
+                    + " | " + humanBytes(s3Bytes) + " from S3 (" + humanBytes((long) bytesPerSec) + "/s)"
                     + " | " + formatNumber(s3Calls) + " S3 calls"
                     + " | " + elapsed + "s";
 

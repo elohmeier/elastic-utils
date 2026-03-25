@@ -20,9 +20,11 @@ final class ProfilingRecorder {
     private volatile String currentSnapshotName;
     private volatile String currentIndexName;
     private volatile int currentShardId = -1;
+    private volatile int currentTotalShards;
     private volatile String currentStage = "starting";
     private volatile int completedTargets;
     private volatile int totalTargets;
+    private volatile long currentShardTotalHits = -1;
 
     private final Map<String, AtomicLong> phaseNanos = new ConcurrentHashMap<>();
     private final AtomicLong s3HeadCalls = new AtomicLong();
@@ -61,10 +63,16 @@ final class ProfilingRecorder {
         currentStage = stage;
     }
 
-    void startShard(String indexName, int shardId, String stage) {
+    void startShard(String indexName, int shardId, int totalShards, String stage) {
         currentIndexName = indexName;
         currentShardId = shardId;
+        currentTotalShards = totalShards;
         currentStage = stage;
+        currentShardTotalHits = -1;
+    }
+
+    void setCurrentShardTotalHits(long totalHits) {
+        currentShardTotalHits = totalHits;
     }
 
     void finishTarget(int completedTargets, int totalTargets) {
@@ -251,6 +259,14 @@ final class ProfilingRecorder {
 
     int currentShardId() {
         return currentShardId;
+    }
+
+    int currentTotalShards() {
+        return currentTotalShards;
+    }
+
+    long currentShardTotalHits() {
+        return currentShardTotalHits;
     }
 
     String currentStage() {
