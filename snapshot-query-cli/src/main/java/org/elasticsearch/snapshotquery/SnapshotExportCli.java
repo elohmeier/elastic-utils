@@ -35,6 +35,7 @@ public class SnapshotExportCli extends Command {
     private final OptionSpec<String> outputOption;
     private final OptionSpec<String> compressionOption;
     private final OptionSpec<Integer> batchSizeOption;
+    private final OptionSpec<String> profileFileOption;
 
     public SnapshotExportCli() {
         super("Export documents from Elasticsearch snapshots in S3 to JSONL");
@@ -48,6 +49,7 @@ public class SnapshotExportCli extends Command {
         outputOption = parser.acceptsAll(Arrays.asList("o", "output"), "Output file path (default: stdout)").withRequiredArg();
         compressionOption = parser.accepts("compression", "Compression: none, zstd").withRequiredArg().defaultsTo("none");
         batchSizeOption = parser.accepts("batch-size", "Documents per search batch").withRequiredArg().ofType(Integer.class).defaultsTo(10000);
+        profileFileOption = parser.accepts("profile-file", "Write JSON profiling counters to this file").withRequiredArg();
     }
 
     @Override
@@ -61,6 +63,7 @@ public class SnapshotExportCli extends Command {
         String outputPath = options.has(outputOption) ? outputOption.value(options) : null;
         String compression = compressionOption.value(options);
         int batchSize = batchSizeOption.value(options);
+        String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
 
         // Parse search body
         SearchBodyParser searchBody = parseSearchBody(options, fromDate, toDate);
@@ -68,10 +71,12 @@ public class SnapshotExportCli extends Command {
         Sort sort = searchBody.sort();
         List<String> sourceFields = searchBody.sourceFields();
 
+        ProfilingRecorder profilingRecorder = profileFile != null ? new ProfilingRecorder() : null;
+
         terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
 
         try (
-            S3ClientFactory.S3Access s3Access = s3Options.connect(options);
+            S3ClientFactory.S3Access s3Access = s3Options.connect(options, profilingRecorder);
             OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)
         ) {
             BlobContainer rootContainer = s3Access.rootContainer();
@@ -115,13 +120,35 @@ public class SnapshotExportCli extends Command {
                     batchSize,
                     out,
                     startTime,
-                    null
+                    profilingRecorder
                 );
             }
 
             out.flush();
             long tookMs = System.currentTimeMillis() - startTime;
             terminal.errorPrintln("Export complete: " + totalExported + " documents in " + (tookMs / 1000) + "s");
+        }
+
+        if (profilingRecorder != null) {
+            profilingRecorder.markCompleted();
+            writeProfileFile(profileFile, profilingRecorder);
+            terminal.errorPrintln("Profile written to " + profileFile);
+        }
+    }
+
+    @SuppressForbidden(reason = "write profile file for cli")
+    private static void writeProfileFile(String path, ProfilingRecorder recorder) throws IOException {
+        java.nio.file.Path outputPath = PathUtils.get(path);
+        java.nio.file.Path parent = outputPath.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        java.nio.file.Path tempFile = outputPath.resolveSibling(outputPath.getFileName() + ".tmp");
+        Files.writeString(tempFile, recorder.renderJson());
+        try {
+            Files.move(tempFile, outputPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            Files.move(tempFile, outputPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
