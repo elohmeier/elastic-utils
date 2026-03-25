@@ -107,6 +107,19 @@ function convertRows(rows: Record<string, unknown>[]): Record<string, unknown>[]
   });
 }
 
+function isZstdCompressed(filename: string): boolean {
+  const lower = filename.toLowerCase();
+  return lower.endsWith(".zst") || lower.endsWith(".zstd");
+}
+
+async function decompressZstd(file: File): Promise<File> {
+  const { decompress } = await import("fzstd");
+  const compressed = new Uint8Array(await file.arrayBuffer());
+  const decompressed = decompress(compressed);
+  const baseName = file.name.replace(/\.zstd?$/i, "");
+  return new File([decompressed], baseName, { type: "application/x-ndjson" });
+}
+
 export async function loadJSONLFile(file: File): Promise<LoadedFile> {
   const db = await getDuckDB();
   const conn = await getConnection();
@@ -114,18 +127,48 @@ export async function loadJSONLFile(file: File): Promise<LoadedFile> {
   // Drop existing table if any
   await conn.query("DROP TABLE IF EXISTS data");
 
-  // Register the file with DuckDB using browser File API
-  await db.registerFileHandle(file.name, file, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+  let fileToLoad = file;
 
-  // Create a table from the JSONL file
-  await conn.query(`
-		CREATE TABLE data AS
-		SELECT * FROM read_ndjson('${file.name}',
-			auto_detect = true,
-			ignore_errors = true,
-			maximum_object_size = 33554432
-		)
-	`);
+  if (isZstdCompressed(file.name)) {
+    // Try DuckDB native zstd (requires parquet extension for compression support)
+    try {
+      await conn.query("LOAD parquet");
+      await db.registerFileHandle(file.name, file, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+      await conn.query(`
+        CREATE TABLE data AS
+        SELECT * FROM read_ndjson('${file.name}',
+          auto_detect = true,
+          ignore_errors = true,
+          maximum_object_size = 33554432,
+          compression = 'zstd'
+        )
+      `);
+    } catch {
+      // Fallback: decompress in JS and load as plain NDJSON
+      await conn.query("DROP TABLE IF EXISTS data");
+      fileToLoad = await decompressZstd(file);
+      await db.registerFileHandle(fileToLoad.name, fileToLoad, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+      await conn.query(`
+        CREATE TABLE data AS
+        SELECT * FROM read_ndjson('${fileToLoad.name}',
+          auto_detect = true,
+          ignore_errors = true,
+          maximum_object_size = 33554432
+        )
+      `);
+    }
+  } else {
+    // Plain NDJSON
+    await db.registerFileHandle(file.name, file, duckdb.DuckDBDataProtocol.BROWSER_FILEREADER, true);
+    await conn.query(`
+      CREATE TABLE data AS
+      SELECT * FROM read_ndjson('${file.name}',
+        auto_detect = true,
+        ignore_errors = true,
+        maximum_object_size = 33554432
+      )
+    `);
+  }
 
   // Get row count
   const countResult = await conn.query("SELECT COUNT(*) as cnt FROM data");

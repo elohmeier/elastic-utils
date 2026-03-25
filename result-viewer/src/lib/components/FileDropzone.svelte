@@ -13,7 +13,7 @@ function handleDrop(e: DragEvent) {
   e.preventDefault();
   isDragging = false;
   const file = e.dataTransfer?.files[0];
-  if (file && (file.name.endsWith(".jsonl") || file.name.endsWith(".ndjson"))) {
+  if (file && /\.(jsonl|ndjson)(\.zstd?)?$/i.test(file.name)) {
     onFileSelect(file);
   }
 }
@@ -75,14 +75,14 @@ function formatSize(bytes: number): string {
     <p class="text-lg font-medium">Drop JSONL file here</p>
     <p class="text-muted-foreground text-sm">or click to browse</p>
     <p class="text-muted-foreground mt-2 text-xs">
-      Supports .jsonl and .ndjson files
+      Supports .jsonl and .ndjson files (plain or zstd-compressed)
     </p>
   {/if}
 
   <input
     bind:this={fileInput}
     type="file"
-    accept=".jsonl,.ndjson"
+    accept=".jsonl,.ndjson,.zst,.zstd"
     class="hidden"
     onchange={handleFileInput}
     disabled={isLoading}
