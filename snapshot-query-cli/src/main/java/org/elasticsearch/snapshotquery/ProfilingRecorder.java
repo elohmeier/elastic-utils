@@ -26,6 +26,9 @@ final class ProfilingRecorder {
     private volatile int totalTargets;
     private volatile long currentShardTotalHits = -1;
 
+    private final ConcurrentHashMap<Integer, String> activeShards = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Long> activeShardHits = new ConcurrentHashMap<>();
+
     private final Map<String, AtomicLong> phaseNanos = new ConcurrentHashMap<>();
     private final AtomicLong s3HeadCalls = new AtomicLong();
     private final AtomicLong s3HeadNanos = new AtomicLong();
@@ -69,6 +72,24 @@ final class ProfilingRecorder {
         currentTotalShards = totalShards;
         currentStage = stage;
         currentShardTotalHits = -1;
+        activateShard(shardId, stage);
+    }
+
+    void activateShard(int shardId, String stage) {
+        activeShards.put(shardId, stage);
+    }
+
+    void updateShardStage(int shardId, String stage) {
+        activeShards.replace(shardId, stage);
+    }
+
+    void setShardTotalHits(int shardId, long totalHits) {
+        activeShardHits.put(shardId, totalHits);
+    }
+
+    void deactivateShard(int shardId) {
+        activeShards.remove(shardId);
+        activeShardHits.remove(shardId);
     }
 
     void setCurrentShardTotalHits(long totalHits) {
@@ -279,6 +300,18 @@ final class ProfilingRecorder {
 
     int totalTargets() {
         return totalTargets;
+    }
+
+    int activeShardCount() {
+        return activeShards.size();
+    }
+
+    long activeShardsTotalHits() {
+        long total = 0;
+        for (long hits : activeShardHits.values()) {
+            total += hits;
+        }
+        return total;
     }
 
     private ShardStats shardStats(String indexName, int shardId) {

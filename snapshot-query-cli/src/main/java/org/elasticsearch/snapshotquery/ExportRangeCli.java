@@ -42,6 +42,7 @@ public class ExportRangeCli extends Command {
     private final OptionSpec<Integer> batchSizeOption;
     private final OptionSpec<Void> allSnapshotsOption;
     private final OptionSpec<String> profileFileOption;
+    private final OptionSpec<Integer> parallelShardsOption;
 
     public ExportRangeCli() {
         super("Export many snapshot/index pairs for an index date range in a single JVM");
@@ -58,6 +59,7 @@ public class ExportRangeCli extends Command {
         batchSizeOption = parser.accepts("batch-size", "Documents per search batch").withRequiredArg().ofType(Integer.class).defaultsTo(10000);
         allSnapshotsOption = parser.accepts("all-snapshots", "Export all matching snapshot/index pairs instead of only the newest snapshot per index");
         profileFileOption = parser.accepts("profile-file", "Write JSON profiling counters to this file").withRequiredArg();
+        parallelShardsOption = parser.accepts("parallel-shards", "Number of shards to export concurrently").withRequiredArg().ofType(Integer.class).defaultsTo(3);
     }
 
     @Override
@@ -73,6 +75,7 @@ public class ExportRangeCli extends Command {
         String compression = compressionOption.value(options);
         int batchSize = batchSizeOption.value(options);
         boolean allSnapshots = options.has(allSnapshotsOption);
+        int parallelShards = parallelShardsOption.value(options);
         String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
         ProfilingRecorder profilingRecorder = new ProfilingRecorder();
         ProfileFileWriter profileFileWriter = ProfileFileWriter.create(profileFile, profilingRecorder);
@@ -148,7 +151,8 @@ public class ExportRangeCli extends Command {
                         out,
                         startTime,
                         profilingRecorder,
-                        progressReporter
+                        progressReporter,
+                        parallelShards
                     );
                     out.flush();
                     profilingRecorder.recordIndexExport(

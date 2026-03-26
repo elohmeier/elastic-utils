@@ -31,6 +31,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 final class SnapshotExportSupport {
 
@@ -49,7 +53,7 @@ final class SnapshotExportSupport {
         ProfilingRecorder profilingRecorder
     ) throws IOException {
         return exportResolvedIndex(
-            terminal, metadataLoader, resolved, luceneQuery, sort, sourceFields, batchSize, out, startTimeMillis, profilingRecorder, null
+            terminal, metadataLoader, resolved, luceneQuery, sort, sourceFields, batchSize, out, startTimeMillis, profilingRecorder, null, 1
         );
     }
 
@@ -66,10 +70,37 @@ final class SnapshotExportSupport {
         ProfilingRecorder profilingRecorder,
         ProgressReporter progressReporter
     ) throws IOException {
+        return exportResolvedIndex(
+            terminal, metadataLoader, resolved, luceneQuery, sort, sourceFields, batchSize, out, startTimeMillis, profilingRecorder,
+            progressReporter, 1
+        );
+    }
+
+    static long exportResolvedIndex(
+        Terminal terminal,
+        SnapshotMetadataLoader metadataLoader,
+        SnapshotMetadataLoader.ResolvedIndex resolved,
+        Query luceneQuery,
+        Sort sort,
+        List<String> sourceFields,
+        int batchSize,
+        OutputStream out,
+        long startTimeMillis,
+        ProfilingRecorder profilingRecorder,
+        ProgressReporter progressReporter,
+        int parallelShards
+    ) throws IOException {
         String indexName = resolved.indexId().getName();
         int shardCount = resolved.shardSnapshots().size();
         if (progressReporter != null) progressReporter.clearLine();
         terminal.errorPrintln("Processing index [" + indexName + "] with " + shardCount + " shard(s)...");
+
+        if (parallelShards > 1 && shardCount > 1) {
+            return exportShardsParallel(
+                terminal, metadataLoader, resolved, luceneQuery, sort, sourceFields, batchSize, out, startTimeMillis,
+                profilingRecorder, progressReporter, Math.min(parallelShards, shardCount)
+            );
+        }
 
         long totalExported = 0;
         for (SnapshotMetadataLoader.ShardSnapshot shardSnapshot : resolved.shardSnapshots()) {
@@ -92,7 +123,7 @@ final class SnapshotExportSupport {
                 }
                 IndexSearcher searcher = new IndexSearcher(reader);
                 long shardStartNanos = System.nanoTime();
-                long shardExported = exportShard(searcher, luceneQuery, sort, sourceFields, batchSize, out, profilingRecorder, indexName, shardId);
+                long shardExported = exportShard(searcher, luceneQuery, sort, sourceFields, batchSize, out, null, profilingRecorder, indexName, shardId);
                 long shardSearchNanos = System.nanoTime() - shardStartNanos;
                 long shardTookMs = shardSearchNanos / 1_000_000L;
                 totalExported += shardExported;
@@ -105,11 +136,100 @@ final class SnapshotExportSupport {
                         + shardTookMs + "ms, elapsed: " + elapsed + "s)"
                 );
                 if (profilingRecorder != null) {
-                    profilingRecorder.startShard(indexName, shardId, shardCount, "done");
+                    profilingRecorder.deactivateShard(shardId);
                 }
             }
         }
 
+        return totalExported;
+    }
+
+    private static long exportShardsParallel(
+        Terminal terminal,
+        SnapshotMetadataLoader metadataLoader,
+        SnapshotMetadataLoader.ResolvedIndex resolved,
+        Query luceneQuery,
+        Sort sort,
+        List<String> sourceFields,
+        int batchSize,
+        OutputStream out,
+        long startTimeMillis,
+        ProfilingRecorder profilingRecorder,
+        ProgressReporter progressReporter,
+        int parallelShards
+    ) throws IOException {
+        String indexName = resolved.indexId().getName();
+        int shardCount = resolved.shardSnapshots().size();
+        Object writeLock = new Object();
+        ExecutorService executor = Executors.newFixedThreadPool(parallelShards);
+        List<Future<Long>> futures = new ArrayList<>();
+
+        for (SnapshotMetadataLoader.ShardSnapshot shardSnapshot : resolved.shardSnapshots()) {
+            futures.add(executor.submit(() -> {
+                int shardId = shardSnapshot.shardId();
+                BlobContainer shardContainer = metadataLoader.shardContainer(resolved.indexId(), shardId);
+                BlobStoreIndexShardSnapshot blobStoreSnapshot = shardSnapshot.snapshot();
+                if (profilingRecorder != null) {
+                    profilingRecorder.activateShard(shardId, "opening");
+                    profilingRecorder.startShard(indexName, shardId, shardCount, "opening");
+                }
+
+                long openStartNanos = System.nanoTime();
+                try (
+                    Directory directory = new SnapshotQueryDirectory(shardContainer, blobStoreSnapshot, profilingRecorder, indexName, shardId);
+                    DirectoryReader reader = DirectoryReader.open(directory)
+                ) {
+                    long openNanos = System.nanoTime() - openStartNanos;
+                    if (profilingRecorder != null) {
+                        profilingRecorder.recordShardOpen(indexName, shardId, openNanos);
+                        profilingRecorder.updateShardStage(shardId, "searching");
+                    }
+                    IndexSearcher searcher = new IndexSearcher(reader);
+                    long shardStartNanos = System.nanoTime();
+                    long shardExported = exportShard(searcher, luceneQuery, sort, sourceFields, batchSize, out, writeLock, profilingRecorder, indexName, shardId);
+                    long shardSearchNanos = System.nanoTime() - shardStartNanos;
+                    long shardTookMs = shardSearchNanos / 1_000_000L;
+
+                    long elapsed = (System.currentTimeMillis() - startTimeMillis) / 1000;
+                    if (progressReporter != null) progressReporter.clearLine();
+                    terminal.errorPrintln(
+                        "  Shard " + shardId + ": exported " + shardExported
+                            + " docs (open: " + (openNanos / 1_000_000L) + "ms, shard: "
+                            + shardTookMs + "ms, elapsed: " + elapsed + "s)"
+                    );
+                    if (profilingRecorder != null) {
+                        profilingRecorder.deactivateShard(shardId);
+                    }
+                    return shardExported;
+                }
+            }));
+        }
+
+        executor.shutdown();
+        long totalExported = 0;
+        IOException failure = null;
+        for (Future<Long> future : futures) {
+            try {
+                totalExported += future.get();
+            } catch (ExecutionException e) {
+                executor.shutdownNow();
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException ioe) {
+                    failure = ioe;
+                } else {
+                    failure = new IOException("Shard export failed", cause);
+                }
+                break;
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+                failure = new IOException("Shard export interrupted", e);
+                break;
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
         return totalExported;
     }
 
@@ -136,6 +256,7 @@ final class SnapshotExportSupport {
         List<String> sourceFields,
         int batchSize,
         OutputStream out,
+        Object writeLock,
         ProfilingRecorder profilingRecorder,
         String indexName,
         int shardId
@@ -159,31 +280,45 @@ final class SnapshotExportSupport {
 
             if (lastDoc == null && profilingRecorder != null && topDocs.totalHits != null) {
                 profilingRecorder.setCurrentShardTotalHits(topDocs.totalHits.value());
+                profilingRecorder.setShardTotalHits(shardId, topDocs.totalHits.value());
             }
 
+            // Fetch stored fields (S3 reads happen here, outside the lock)
             StoredFields storedFields = searcher.storedFields();
-            long batchExported = 0;
-
+            List<byte[]> batchBytes = new ArrayList<>(topDocs.scoreDocs.length);
             for (ScoreDoc scoreDoc : topDocs.scoreDocs) {
                 var doc = storedFields.document(scoreDoc.doc);
                 var sourceField = doc.getBinaryValue("_source");
                 if (sourceField != null) {
-                    byte[] sourceBytes = filterSource(sourceField.bytes, sourceField.offset, sourceField.length, fieldSet);
-                    out.write(sourceBytes);
-                    out.write('\n');
-                    batchExported++;
+                    batchBytes.add(filterSource(sourceField.bytes, sourceField.offset, sourceField.length, fieldSet));
                 }
             }
 
-            exported += batchExported;
-            if (profilingRecorder != null && batchExported > 0) {
-                profilingRecorder.recordShardSearch(indexName, shardId, batchExported, System.nanoTime() - batchStartNanos);
+            // Write batch to output (synchronized when concurrent)
+            if (writeLock != null) {
+                synchronized (writeLock) {
+                    writeBatch(out, batchBytes);
+                }
+            } else {
+                writeBatch(out, batchBytes);
+            }
+
+            exported += batchBytes.size();
+            if (profilingRecorder != null && !batchBytes.isEmpty()) {
+                profilingRecorder.recordShardSearch(indexName, shardId, batchBytes.size(), System.nanoTime() - batchStartNanos);
             }
 
             lastDoc = topDocs.scoreDocs[topDocs.scoreDocs.length - 1];
         }
 
         return exported;
+    }
+
+    private static void writeBatch(OutputStream out, List<byte[]> batchBytes) throws IOException {
+        for (byte[] sourceBytes : batchBytes) {
+            out.write(sourceBytes);
+            out.write('\n');
+        }
     }
 
     private static byte[] filterSource(byte[] bytes, int offset, int length, Set<String> fields) throws IOException {

@@ -31,9 +31,17 @@ final class ProgressReporter implements AutoCloseable {
                     return;
                 }
 
+                int activeCount = profilingRecorder.activeShardCount();
                 int shardId = profilingRecorder.currentShardId();
                 int totalShards = profilingRecorder.currentTotalShards();
-                String shardText = shardId >= 0 ? " shard " + (shardId + 1) + "/" + totalShards : "";
+                String shardText;
+                if (activeCount > 1) {
+                    shardText = " " + activeCount + " shards active/" + totalShards;
+                } else if (shardId >= 0) {
+                    shardText = " shard " + (shardId + 1) + "/" + totalShards;
+                } else {
+                    shardText = "";
+                }
                 String stage = profilingRecorder.currentStage();
                 long docs = profilingRecorder.totalDocsExported();
                 long s3Bytes = profilingRecorder.s3BytesRead();
@@ -41,8 +49,13 @@ final class ProgressReporter implements AutoCloseable {
                 long elapsedMs = profilingRecorder.totalMillis();
                 long elapsed = elapsedMs / 1000;
 
-                long totalHits = profilingRecorder.currentShardTotalHits();
-                String hitsText = totalHits >= 0 ? " (" + formatNumber(totalHits) + " hits)" : "";
+                long totalHits;
+                if (activeCount > 1) {
+                    totalHits = profilingRecorder.activeShardsTotalHits();
+                } else {
+                    totalHits = profilingRecorder.currentShardTotalHits();
+                }
+                String hitsText = totalHits > 0 ? " (" + formatNumber(totalHits) + " hits)" : "";
 
                 double docsPerSec = elapsedMs > 0 ? docs * 1000.0 / elapsedMs : 0;
                 double bytesPerSec = elapsedMs > 0 ? s3Bytes * 1000.0 / elapsedMs : 0;

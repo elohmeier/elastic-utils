@@ -64,37 +64,35 @@ public class S3ClientFactory {
             builder.forcePathStyle(true); // needed for MinIO and other S3-compatible stores
         }
 
-        if (trustAllCerts || resolve != null) {
-            ApacheHttpClient.Builder httpBuilder = ApacheHttpClient.builder();
+        ApacheHttpClient.Builder httpBuilder = ApacheHttpClient.builder().maxConnections(100);
 
-            if (trustAllCerts) {
-                httpBuilder.tlsTrustManagersProvider(() -> new javax.net.ssl.TrustManager[] {
-                    new javax.net.ssl.X509TrustManager() {
-                        public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
-                        public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
-                        public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
-                    }
-                });
-            }
-
-            if (resolve != null) {
-                // Format: "hostname:ip" (e.g. "s3-01.example.com:127.0.0.1")
-                String[] parts = resolve.split(":", 2);
-                String resolveHost = parts[0];
-                String resolveIp = parts[1];
-                httpBuilder.dnsResolver(new DnsResolver() {
-                    @Override
-                    public InetAddress[] resolve(String host) throws UnknownHostException {
-                        if (host.equals(resolveHost)) {
-                            return new InetAddress[] { InetAddress.getByName(resolveIp) };
-                        }
-                        return InetAddress.getAllByName(host);
-                    }
-                });
-            }
-
-            builder.httpClient(httpBuilder.build());
+        if (trustAllCerts) {
+            httpBuilder.tlsTrustManagersProvider(() -> new javax.net.ssl.TrustManager[] {
+                new javax.net.ssl.X509TrustManager() {
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
+                    public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                    public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                }
+            });
         }
+
+        if (resolve != null) {
+            // Format: "hostname:ip" (e.g. "s3-01.example.com:127.0.0.1")
+            String[] parts = resolve.split(":", 2);
+            String resolveHost = parts[0];
+            String resolveIp = parts[1];
+            httpBuilder.dnsResolver(new DnsResolver() {
+                @Override
+                public InetAddress[] resolve(String host) throws UnknownHostException {
+                    if (host.equals(resolveHost)) {
+                        return new InetAddress[] { InetAddress.getByName(resolveIp) };
+                    }
+                    return InetAddress.getAllByName(host);
+                }
+            });
+        }
+
+        builder.httpClient(httpBuilder.build());
 
         S3Client client = builder.build();
         BlobPath rootPath = basePath.isEmpty() ? BlobPath.EMPTY : BlobPath.EMPTY.add(basePath);

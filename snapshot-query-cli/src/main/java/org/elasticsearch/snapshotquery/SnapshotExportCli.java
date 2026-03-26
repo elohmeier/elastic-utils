@@ -36,6 +36,7 @@ public class SnapshotExportCli extends Command {
     private final OptionSpec<String> compressionOption;
     private final OptionSpec<Integer> batchSizeOption;
     private final OptionSpec<String> profileFileOption;
+    private final OptionSpec<Integer> parallelShardsOption;
 
     public SnapshotExportCli() {
         super("Export documents from Elasticsearch snapshots in S3 to JSONL");
@@ -50,6 +51,7 @@ public class SnapshotExportCli extends Command {
         compressionOption = parser.accepts("compression", "Compression: none, zstd").withRequiredArg().defaultsTo("none");
         batchSizeOption = parser.accepts("batch-size", "Documents per search batch").withRequiredArg().ofType(Integer.class).defaultsTo(10000);
         profileFileOption = parser.accepts("profile-file", "Write JSON profiling counters to this file").withRequiredArg();
+        parallelShardsOption = parser.accepts("parallel-shards", "Number of shards to export concurrently").withRequiredArg().ofType(Integer.class).defaultsTo(3);
     }
 
     @Override
@@ -63,6 +65,7 @@ public class SnapshotExportCli extends Command {
         String outputPath = options.has(outputOption) ? outputOption.value(options) : null;
         String compression = compressionOption.value(options);
         int batchSize = batchSizeOption.value(options);
+        int parallelShards = parallelShardsOption.value(options);
         String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
 
         // Parse search body
@@ -134,7 +137,8 @@ public class SnapshotExportCli extends Command {
                     out,
                     startTime,
                     profilingRecorder,
-                    progressReporter
+                    progressReporter,
+                    parallelShards
                 );
                 profilingRecorder.finishTarget(current, resolvedIndices.size());
             }
