@@ -123,6 +123,81 @@ When a release is triggered, semantic-release:
 3. Creates a GitHub release with auto-generated release notes
 4. Builds and attaches the `snapshot-query-cli` shadow JAR to the GitHub release
 
+## snapshot-query-cli (Java)
+
+A standalone CLI (shadow JAR) that queries Elasticsearch snapshots offline directly from S3-compatible storage, without a running Elasticsearch cluster.
+
+### Project Structure
+
+```
+snapshot-query-cli/
+├── build.gradle                    # Gradle build with shadowJar plugin
+├── settings.gradle
+├── src/main/java/org/elasticsearch/snapshotquery/
+│   ├── SnapshotQueryMain.java      # Entry point, picocli multi-command
+│   ├── SnapshotQueryCli.java       # "query" subcommand
+│   ├── SnapshotExportCli.java      # "export" subcommand (JSONL export)
+│   ├── ExportRangeCli.java         # "export-range" subcommand (multi-index date range)
+│   ├── ListSnapshotsCli.java       # "snapshots" subcommand
+│   ├── SnapshotQueryCliProvider.java # Shared logic for opening snapshot indices
+│   ├── SnapshotQueryDirectory.java # Lucene Directory backed by S3 snapshot blobs
+│   ├── SnapshotMetadataLoader.java # Loads snapshot/index metadata from S3
+│   ├── SnapshotExportSupport.java  # Shared export utilities (JSONL, zstd)
+│   ├── SearchBodyParser.java       # Parses full ES search body JSON
+│   ├── SimpleQueryTranslator.java  # Translates ES query DSL → Lucene queries
+│   ├── S3Options.java              # picocli S3 connection options mixin
+│   ├── S3ClientFactory.java        # AWS S3 client setup
+│   ├── ProfilingRecorder.java      # Records performance counters
+│   └── ProgressReporter.java       # Progress bar for exports
+└── tests/
+    └── integration-test.sh         # End-to-end test (MinIO + ES via Docker)
+```
+
+### Commands
+
+```bash
+cd snapshot-query-cli
+./gradlew shadowJar                # Build standalone JAR
+./gradlew clean shadowJar          # Clean build
+
+# Run integration tests (requires Docker, Java 21+, jq, curl)
+./tests/integration-test.sh
+./tests/integration-test.sh --skip-build          # Skip JAR rebuild
+./tests/integration-test.sh --jar path/to/cli.jar # Use specific JAR
+```
+
+### Integration Tests
+
+The integration test (`tests/integration-test.sh`) is a comprehensive end-to-end test that:
+
+1. Starts MinIO (S3-compatible) and Elasticsearch via Docker
+2. Indexes test documents and creates snapshots to MinIO
+3. Stops Elasticsearch
+4. Runs query/export/snapshots CLI commands against the offline snapshot
+5. Validates results (hit counts, JSONL output, zstd compression, alias resolution, date range filtering, export-range with profiling)
+
+### Elasticsearch Reference Code
+
+The snapshot-query-cli reads Elasticsearch snapshot formats directly. The upstream Elasticsearch source at `~/repos/github.com/elastic/elasticsearch` is useful for understanding internal formats:
+
+```
+server/src/main/java/org/elasticsearch/
+├── snapshots/
+│   ├── SnapshotInfo.java               # Snapshot metadata model
+│   ├── SnapshotId.java                 # Snapshot identifier
+│   ├── SnapshotState.java              # Snapshot states (SUCCESS, FAILED, etc.)
+│   └── SnapshotsService.java           # Snapshot lifecycle management
+├── repositories/
+│   ├── RepositoryData.java             # Repository-level metadata (index of snapshots)
+│   ├── IndexId.java                    # Index identifier within a repository
+│   ├── ShardGenerations.java           # Shard generation tracking
+│   └── blobstore/
+│       ├── BlobStoreRepository.java    # Blob storage implementation (S3/GCS/Azure)
+│       └── ChecksumBlobStoreFormat.java # Serialization format for metadata blobs
+└── index/engine/
+    └── Engine.java                     # Lucene index engine (searcher lifecycle)
+```
+
 ## Adding New Commands
 
 After adding new CLI commands:
