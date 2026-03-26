@@ -981,11 +981,11 @@ class JsonlSink(HitSink):
     def write_hits(self, hits: list[dict[str, Any]]) -> None:
         if self._file:
             for hit in hits:
-                self._file.write(json.dumps(hit) + "\n")
+                self._file.write(json.dumps(hit.get("_source", hit)) + "\n")
             self._file.flush()
             return
         for hit in hits:
-            print(json.dumps(hit))
+            print(json.dumps(hit.get("_source", hit)))
 
     def close(self) -> None:
         if self._file:
@@ -1036,7 +1036,9 @@ def write_jsonl_hits_file(
     hits: list[dict[str, Any]],
     compression: str,
 ) -> None:
-    payload = "".join(f"{json.dumps(hit)}\n" for hit in hits).encode("utf-8")
+    payload = "".join(
+        f"{json.dumps(hit.get('_source', hit))}\n" for hit in hits
+    ).encode("utf-8")
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output.parent / f"{output.name}.tmp"
     if compression == "none":
@@ -2768,19 +2770,8 @@ def import_docs(
             raise SystemExit(1)
 
         total_read += 1
-        doc_id = hit.get("_id")
-        source = hit.get("_source")
-        if not isinstance(doc_id, str):
-            console.print(f"[red]Line {line_number} missing string '_id' field.[/red]")
-            raise SystemExit(1)
-        if not isinstance(source, dict):
-            console.print(
-                f"[red]Line {line_number} missing object '_source' field.[/red]"
-            )
-            raise SystemExit(1)
-
-        batch_lines.append(json.dumps({"create": {"_index": index, "_id": doc_id}}))
-        batch_lines.append(json.dumps(source))
+        batch_lines.append(json.dumps({"create": {"_index": index}}))
+        batch_lines.append(json.dumps(hit))
         batch_docs += 1
 
         if batch_docs >= batch_size:

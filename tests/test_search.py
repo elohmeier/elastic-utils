@@ -1265,7 +1265,7 @@ def test_search_get_jsonl_output(
 
     lines = output_file.read_text().strip().split("\n")
     assert len(lines) == 2
-    assert json.loads(lines[0])["_id"] == "1"
+    assert json.loads(lines[0])["message"] == "test1"
 
 
 def test_search_get_json_output(runner: CliRunner, authenticated_creds: Path) -> None:
@@ -1411,7 +1411,7 @@ def test_search_import_success(
 ) -> None:
     """Test import command with successful bulk create."""
     input_file = tmp_path / "input.jsonl"
-    input_file.write_text('{"_id":"1","_source":{"message":"test"}}\n')
+    input_file.write_text('{"message":"test"}\n')
 
     mock_client = MagicMock()
     mock_client.index_exists.return_value = True
@@ -1449,7 +1449,7 @@ def test_search_import_conflict_skipped(
 ) -> None:
     """Test import command skips conflicts and exits successfully."""
     input_file = tmp_path / "input.jsonl"
-    input_file.write_text('{"_id":"1","_source":{"message":"test"}}\n')
+    input_file.write_text('{"message":"test"}\n')
 
     mock_client = MagicMock()
     mock_client.index_exists.return_value = True
@@ -1486,7 +1486,7 @@ def test_search_import_non_conflict_failure(
 ) -> None:
     """Test import command exits with error for non-conflict bulk failures."""
     input_file = tmp_path / "input.jsonl"
-    input_file.write_text('{"_id":"1","_source":{"message":"test"}}\n')
+    input_file.write_text('{"message":"test"}\n')
 
     mock_client = MagicMock()
     mock_client.index_exists.return_value = True
@@ -1529,42 +1529,6 @@ def test_search_import_non_conflict_failure(
     assert result.exit_code == 1
     assert "Bulk item failed" in result.output
     assert "Failed: 1" in result.output
-
-
-def test_search_import_missing_source_field(
-    runner: CliRunner,
-    tmp_path: Path,
-) -> None:
-    """Test import command validates required _source field."""
-    input_file = tmp_path / "input.jsonl"
-    input_file.write_text('{"_id":"1"}\n')
-
-    mock_client = MagicMock()
-    mock_client.index_exists.return_value = True
-    mock_client.session.return_value.__enter__.return_value = mock_client
-    mock_client.session.return_value.__exit__.return_value = None
-
-    with patch("elastic_utils.search.create_client", return_value=mock_client):
-        result = runner.invoke(
-            cli,
-            [
-                "search",
-                "import",
-                "--index",
-                "dest-index",
-                "--input",
-                str(input_file),
-                "--url",
-                "http://dest:9200",
-                "--api-key-id",
-                "id",
-                "--api-key",
-                "key",
-            ],
-        )
-
-    assert result.exit_code == 1
-    assert "missing object '_source' field" in result.output
 
 
 def test_search_export_with_explicit_auth(
@@ -2377,33 +2341,13 @@ def test_search_export_import_roundtrip_integration(
     )
     search_response.raise_for_status()
     hits = search_response.json()["hits"]["hits"]
-    restored_ids = sorted(hit["_id"] for hit in hits)
-    assert restored_ids == expected_ids
-
-    reimport_result = runner.invoke(
-        cli,
-        [
-            "search",
-            "import",
-            "--index",
-            dest_index,
-            "--input",
-            str(output_file),
-            "--url",
-            url,
-            "--username",
-            elasticsearch_secure_service.user,
-            "--password",
-            elasticsearch_secure_service.password,
-            "--batch-size",
-            "2",
-            "--refresh",
-            "wait_for",
-        ],
-    )
-    assert reimport_result.exit_code == 0
-    assert "Created: 0" in reimport_result.output
-    assert "Conflicts skipped: 3" in reimport_result.output
+    assert len(hits) == 3
+    restored_messages = sorted(hit["_source"]["message"] for hit in hits)
+    assert restored_messages == [
+        "roundtrip message 1",
+        "roundtrip message 2",
+        "roundtrip message 3",
+    ]
 
 
 def test_search_export_import_zstd_roundtrip_integration(
@@ -2558,8 +2502,13 @@ def test_search_export_import_zstd_roundtrip_integration(
     )
     search_response.raise_for_status()
     hits = search_response.json()["hits"]["hits"]
-    restored_ids = sorted(hit["_id"] for hit in hits)
-    assert restored_ids == expected_ids
+    assert len(hits) == 3
+    restored_messages = sorted(hit["_source"]["message"] for hit in hits)
+    assert restored_messages == [
+        "zstd roundtrip message 1",
+        "zstd roundtrip message 2",
+        "zstd roundtrip message 3",
+    ]
 
 
 def test_search_export_interrupt_shutdown_integration(

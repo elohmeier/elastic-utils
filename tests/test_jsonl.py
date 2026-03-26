@@ -47,14 +47,14 @@ class TestParseFieldSpec:
     """Tests for parse_field_spec helper."""
 
     def test_with_name(self) -> None:
-        assert parse_field_spec("_source.@timestamp:timestamp") == (
-            "_source.@timestamp",
+        assert parse_field_spec("@timestamp:timestamp") == (
+            "@timestamp",
             "timestamp",
         )
 
     def test_without_name(self) -> None:
-        assert parse_field_spec("_source.host.name") == (
-            "_source.host.name",
+        assert parse_field_spec("host.name") == (
+            "host.name",
             "name",
         )
 
@@ -74,33 +74,25 @@ class TestExtractCommand:
         """Create a sample JSONL file for testing."""
         data = [
             {
-                "_source": {
-                    "message": "Error: code ID-0815-ABCD-1234 failed",
-                    "@timestamp": "2026-01-14T07:34:50.697Z",
-                    "host": {"name": "server1"},
-                }
+                "message": "Error: code ID-0815-ABCD-1234 failed",
+                "@timestamp": "2026-01-14T07:34:50.697Z",
+                "host": {"name": "server1"},
             },
             {
-                "_source": {
-                    "message": "Code ID-0815-WXYZ-5678 succeeded",
-                    "@timestamp": "2026-01-14T08:00:00.000Z",
-                    "host": {"name": "server2"},
-                }
+                "message": "Code ID-0815-WXYZ-5678 succeeded",
+                "@timestamp": "2026-01-14T08:00:00.000Z",
+                "host": {"name": "server2"},
             },
             {
-                "_source": {
-                    "message": "No codes here",
-                    "@timestamp": "2026-01-14T09:00:00.000Z",
-                    "host": {"name": "server3"},
-                }
+                "message": "No codes here",
+                "@timestamp": "2026-01-14T09:00:00.000Z",
+                "host": {"name": "server3"},
             },
             # Duplicate entry to test deduplication
             {
-                "_source": {
-                    "message": "Error: code ID-0815-ABCD-1234 failed",
-                    "@timestamp": "2026-01-14T07:34:50.697Z",
-                    "host": {"name": "server1"},
-                }
+                "message": "Error: code ID-0815-ABCD-1234 failed",
+                "@timestamp": "2026-01-14T07:34:50.697Z",
+                "host": {"name": "server1"},
             },
         ]
         jsonl_file = tmp_path / "test.jsonl"
@@ -122,7 +114,7 @@ class TestExtractCommand:
                 "-p",
                 r"ID-0815-[A-Z]{4}-\d{4}",
                 "-f",
-                "_source.@timestamp:timestamp",
+                "@timestamp:timestamp",
                 "--format",
                 "csv",
                 "-o",
@@ -162,7 +154,7 @@ class TestExtractCommand:
                 "-p",
                 r"ID-0815-[A-Z]{4}-\d{4}",
                 "-f",
-                "_source.@timestamp:timestamp",
+                "@timestamp:timestamp",
                 "-o",
                 str(output),
                 str(sample_jsonl),
@@ -216,9 +208,9 @@ class TestExtractCommand:
                 "-p",
                 r"ID-0815-[A-Z]{4}-\d{4}",
                 "-f",
-                "_source.@timestamp:timestamp",
+                "@timestamp:timestamp",
                 "-f",
-                "_source.host.name:host",
+                "host.name:host",
                 "--format",
                 "csv",
                 "-o",

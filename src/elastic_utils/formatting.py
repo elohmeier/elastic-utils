@@ -84,7 +84,7 @@ def format_hits(
     if output_format == "json":
         return json.dumps(hits, indent=2)
     else:  # jsonl
-        return "\n".join(json.dumps(hit) for hit in hits)
+        return "\n".join(json.dumps(hit.get("_source", hit)) for hit in hits)
 
 
 def write_output(

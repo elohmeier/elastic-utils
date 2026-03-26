@@ -49,7 +49,7 @@ def jsonl() -> None:
 @click.option(
     "--source-field",
     "-s",
-    default="_source.message",
+    default="message",
     help="JSON path to search for pattern matches.",
 )
 @click.option(
@@ -94,9 +94,9 @@ def extract(
 
     Examples:
 
-        elastic-utils jsonl extract -p 'ID-\\d{4}-[A-Z]+' -f '_source.@timestamp:timestamp' -o out.xlsx data.jsonl
+        elastic-utils jsonl extract -p 'ID-\\d{4}-[A-Z]+' -f '@timestamp:timestamp' -o out.xlsx data.jsonl
 
-        elastic-utils jsonl extract -p 'ERROR|WARN' -s '_source.level' --format csv -o out.csv logs.jsonl
+        elastic-utils jsonl extract -p 'ERROR|WARN' -s 'level' --format csv -o out.csv logs.jsonl
     """
     # Compile regex
     try:
