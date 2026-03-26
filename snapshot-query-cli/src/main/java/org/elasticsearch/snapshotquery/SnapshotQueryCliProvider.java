@@ -4,13 +4,13 @@ import org.elasticsearch.cli.CliToolProvider;
 import org.elasticsearch.cli.Command;
 
 public class SnapshotQueryCliProvider implements CliToolProvider {
-    @Override
-    public String name() {
-        return "snapshot";
-    }
+  @Override
+  public String name() {
+    return "snapshot";
+  }
 
-    @Override
-    public Command create() {
-        return new SnapshotQueryMain();
-    }
+  @Override
+  public Command create() {
+    return new SnapshotQueryMain();
+  }
 }

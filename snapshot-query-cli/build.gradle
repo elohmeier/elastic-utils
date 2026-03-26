@@ -1,6 +1,7 @@
 plugins {
     id 'java'
     id 'com.gradleup.shadow' version '9.0.0-beta12'
+    id 'com.diffplug.spotless' version '7.0.4'
 }
 
 group = 'de.nerdworks'
@@ -48,6 +49,15 @@ dependencies {
     runtimeOnly "org.apache.logging.log4j:log4j-api:2.19.0"
     runtimeOnly "org.apache.logging.log4j:log4j-core:2.19.0"
     runtimeOnly "org.apache.logging.log4j:log4j-slf4j2-impl:2.19.0"
+}
+
+spotless {
+    java {
+        googleJavaFormat()
+        removeUnusedImports()
+        trimTrailingWhitespace()
+        endWithNewline()
+    }
 }
 
 shadowJar {

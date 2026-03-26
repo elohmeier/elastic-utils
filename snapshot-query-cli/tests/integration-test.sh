@@ -136,14 +136,14 @@ done
 
 # ── Step 1: Build the standalone JAR ─────────────────────────────────────────
 
-if [ -z "$JAR_PATH" ]; then
-    JAR_PATH=$(ls -1 "$PROJECT_ROOT"/build/libs/elasticsearch-snapshot-query-cli-*.jar 2>/dev/null | head -1)
-fi
-
 if [ "$SKIP_BUILD" = false ]; then
     log "Building standalone JAR..."
     cd "$PROJECT_ROOT"
     JAVA_HOME="${JAVA_HOME:-}" ./gradlew clean shadowJar 2>&1 | tail -5
+fi
+
+if [ -z "$JAR_PATH" ]; then
+    JAR_PATH=$(ls -1 "$PROJECT_ROOT"/build/libs/elasticsearch-snapshot-query-cli-*.jar 2>/dev/null | head -1)
 fi
 
 [ -f "$JAR_PATH" ] || die "JAR not found at $JAR_PATH. Run without --skip-build."

@@ -50,3 +50,11 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+
+      - id: spotless-java
+        name: Format & lint Java code with Spotless
+        entry: bash -c 'cd snapshot-query-cli && ./gradlew spotlessApply'
+        language: system
+        types: [java]
+        pass_filenames: false
+        stages: [pre-push]
