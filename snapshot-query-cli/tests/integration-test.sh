@@ -141,7 +141,7 @@ fi
 if [ "$SKIP_BUILD" = false ]; then
     log "Building standalone JAR..."
     cd "$PROJECT_ROOT"
-    JAVA_HOME="${JAVA_HOME:-}" ./gradlew shadowJar 2>&1 | tail -5
+    JAVA_HOME="${JAVA_HOME:-}" ./gradlew clean shadowJar 2>&1 | tail -5
 fi
 
 [ -f "$JAR_PATH" ] || die "JAR not found at $JAR_PATH. Run without --skip-build."
