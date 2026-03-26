@@ -97,6 +97,32 @@ specification/
 4. Add docstring with spec file reference
 5. Update tests with complete mock data for required fields
 
+## Commit Convention
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/). Commit messages must follow the format:
+
+```
+<type>(<scope>): <description>
+```
+
+Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`.
+
+### Release implications
+
+Releases are automated via [semantic-release](https://github.com/semantic-release/semantic-release) on every push to `main` (see `.releaserc.json` and `.github/workflows/release.yml`):
+
+- `fix:` commits trigger a **patch** release (e.g., 1.0.0 → 1.0.1)
+- `feat:` commits trigger a **minor** release (e.g., 1.0.0 → 1.1.0)
+- `BREAKING CHANGE:` in the commit footer (or `!` after the type) triggers a **major** release (e.g., 1.0.0 → 2.0.0)
+- Other types (`docs`, `chore`, `refactor`, `test`, `ci`) do **not** trigger a release
+
+When a release is triggered, semantic-release:
+
+1. Bumps the version in `pyproject.toml`, `snapshot-query-cli/build.gradle`, and `uv.lock`
+2. Commits the version bump with `chore(release): <version> [skip ci]`
+3. Creates a GitHub release with auto-generated release notes
+4. Builds and attaches the `snapshot-query-cli` shadow JAR to the GitHub release
+
 ## Adding New Commands
 
 After adding new CLI commands:
