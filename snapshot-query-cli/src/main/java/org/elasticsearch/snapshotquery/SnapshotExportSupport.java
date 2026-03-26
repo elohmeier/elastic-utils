@@ -328,16 +328,7 @@ final class SnapshotExportSupport {
 
         try (XContentParser parser = XContentType.JSON.xContent().createParser(XContentParserConfiguration.EMPTY, bytes, offset, length)) {
             parser.nextToken();
-            Map<String, Object> filtered = new HashMap<>();
-            while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
-                String fieldName = parser.currentName();
-                parser.nextToken();
-                if (fields.contains(fieldName)) {
-                    filtered.put(fieldName, parseValue(parser));
-                } else {
-                    parser.skipChildren();
-                }
-            }
+            Map<String, Object> filtered = filterObject(parser, fields, "");
 
             StringBuilder sb = new StringBuilder();
             sb.append('{');
@@ -351,6 +342,47 @@ final class SnapshotExportSupport {
             sb.append('}');
             return sb.toString().getBytes(StandardCharsets.UTF_8);
         }
+    }
+
+    /**
+     * Recursively filter an object's fields based on dotted field paths.
+     * E.g., fields={"host.name","message"} with prefix="" will include "message" directly
+     * and recurse into "host" looking for "name".
+     */
+    private static Map<String, Object> filterObject(XContentParser parser, Set<String> fields, String prefix) throws IOException {
+        Map<String, Object> filtered = new HashMap<>();
+        while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
+            String fieldName = parser.currentName();
+            parser.nextToken();
+            String fullPath = prefix.isEmpty() ? fieldName : prefix + "." + fieldName;
+
+            if (fields.contains(fullPath)) {
+                // Exact match — include the whole value
+                filtered.put(fieldName, parseValue(parser));
+            } else if (parser.currentToken() == XContentParser.Token.START_OBJECT && hasChildFields(fields, fullPath)) {
+                // This is a parent of a requested dotted path — recurse
+                Map<String, Object> nested = filterObject(parser, fields, fullPath);
+                if (!nested.isEmpty()) {
+                    filtered.put(fieldName, nested);
+                }
+            } else {
+                parser.skipChildren();
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * Check if any field in the set starts with the given prefix followed by a dot.
+     */
+    private static boolean hasChildFields(Set<String> fields, String prefix) {
+        String prefixDot = prefix + ".";
+        for (String field : fields) {
+            if (field.startsWith(prefixDot)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static byte[] compactJson(byte[] bytes, int offset, int length) {

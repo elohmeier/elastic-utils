@@ -92,7 +92,9 @@ create_logs_index() {
       "status":    { "type": "keyword" },
       "@timestamp": { "type": "date" },
       "count":     { "type": "long" },
-      "host":      { "type": "keyword" }
+      "host":      { "type": "keyword" },
+      "server":    { "properties": { "hostname": { "type": "keyword" }, "dc": { "type": "keyword" } } },
+      "k8s":       { "properties": { "namespace": { "type": "keyword" }, "pod_name": { "type": "keyword" } } }
     }
   }
 }' >/dev/null
@@ -231,25 +233,25 @@ es_api POST "/_aliases" -d "{
 
 es_api POST "/_bulk" -d '
 {"index":{"_index":"test-logs","_id":"1"}}
-{"message":"Server started successfully","level":"info","status":"ok","@timestamp":"2024-01-15T10:00:00Z","count":1,"host":"web-01"}
+{"message":"Server started successfully","level":"info","status":"ok","@timestamp":"2024-01-15T10:00:00Z","count":1,"host":"web-01","server":{"hostname":"web-01","dc":"us-east"},"k8s":{"namespace":"production","pod_name":"app-pod-1"}}
 {"index":{"_index":"test-logs","_id":"2"}}
-{"message":"Connection timeout to database","level":"error","status":"error","@timestamp":"2024-01-15T10:01:00Z","count":3,"host":"web-01"}
+{"message":"Connection timeout to database","level":"error","status":"error","@timestamp":"2024-01-15T10:01:00Z","count":3,"host":"web-01","server":{"hostname":"web-01","dc":"us-east"},"k8s":{"namespace":"production","pod_name":"app-pod-2"}}
 {"index":{"_index":"test-logs","_id":"3"}}
-{"message":"Request processed in 250ms","level":"info","status":"ok","@timestamp":"2024-01-16T10:02:00Z","count":42,"host":"web-02"}
+{"message":"Request processed in 250ms","level":"info","status":"ok","@timestamp":"2024-01-16T10:02:00Z","count":42,"host":"web-02","server":{"hostname":"web-02","dc":"us-west"},"k8s":{"namespace":"staging","pod_name":"app-pod-3"}}
 {"index":{"_index":"test-logs","_id":"4"}}
-{"message":"Disk usage above 90%","level":"warn","status":"warning","@timestamp":"2024-01-16T10:03:00Z","count":1,"host":"web-03"}
+{"message":"Disk usage above 90%","level":"warn","status":"warning","@timestamp":"2024-01-16T10:03:00Z","count":1,"host":"web-03","server":{"hostname":"web-03","dc":"us-west"},"k8s":{"namespace":"production","pod_name":"app-pod-4"}}
 {"index":{"_index":"test-logs","_id":"5"}}
-{"message":"Authentication failed for user admin","level":"error","status":"error","@timestamp":"2024-01-17T10:04:00Z","count":5,"host":"web-02"}
+{"message":"Authentication failed for user admin","level":"error","status":"error","@timestamp":"2024-01-17T10:04:00Z","count":5,"host":"web-02","server":{"hostname":"web-02","dc":"us-east"},"k8s":{"namespace":"staging","pod_name":"app-pod-5"}}
 {"index":{"_index":"test-logs","_id":"6"}}
-{"message":"Cache cleared","level":"info","status":"ok","@timestamp":"2024-01-17T10:05:00Z","count":1,"host":"web-01"}
+{"message":"Cache cleared","level":"info","status":"ok","@timestamp":"2024-01-17T10:05:00Z","count":1,"host":"web-01","server":{"hostname":"web-01","dc":"us-east"},"k8s":{"namespace":"production","pod_name":"app-pod-6"}}
 {"index":{"_index":"test-logs","_id":"7"}}
-{"message":"Out of memory error","level":"error","status":"error","@timestamp":"2024-01-18T10:06:00Z","count":1,"host":"web-03"}
+{"message":"Out of memory error","level":"error","status":"error","@timestamp":"2024-01-18T10:06:00Z","count":1,"host":"web-03","server":{"hostname":"web-03","dc":"us-west"},"k8s":{"namespace":"production","pod_name":"app-pod-7"}}
 {"index":{"_index":"test-logs","_id":"8"}}
-{"message":"Backup completed","level":"info","status":"ok","@timestamp":"2024-01-18T10:07:00Z","count":1,"host":"web-01"}
+{"message":"Backup completed","level":"info","status":"ok","@timestamp":"2024-01-18T10:07:00Z","count":1,"host":"web-01","server":{"hostname":"web-01","dc":"us-east"},"k8s":{"namespace":"staging","pod_name":"app-pod-8"}}
 {"index":{"_index":"test-logs","_id":"9"}}
-{"message":"SSL certificate expiring soon","level":"warn","status":"warning","@timestamp":"2024-01-19T10:08:00Z","count":2,"host":"web-02"}
+{"message":"SSL certificate expiring soon","level":"warn","status":"warning","@timestamp":"2024-01-19T10:08:00Z","count":2,"host":"web-02","server":{"hostname":"web-02","dc":"us-west"},"k8s":{"namespace":"production","pod_name":"app-pod-9"}}
 {"index":{"_index":"test-logs","_id":"10"}}
-{"message":"New deployment rolled out","level":"info","status":"ok","@timestamp":"2024-01-19T10:09:00Z","count":1,"host":"web-03"}
+{"message":"New deployment rolled out","level":"info","status":"ok","@timestamp":"2024-01-19T10:09:00Z","count":1,"host":"web-03","server":{"hostname":"web-03","dc":"us-east"},"k8s":{"namespace":"staging","pod_name":"app-pod-10"}}
 ' | jq -r '.errors' || die "Failed to bulk index"
 
 es_api POST "/${INDEX_NAME}/_flush" >/dev/null 2>&1 || true
@@ -696,6 +698,58 @@ else
     fail "full body export: output file not created"
 fi
 
+# ── Export Test 8: _source filtering with dotted paths (nested fields) ─────
+
+QUERY_FILE="$EXPORT_DIR/dotted-source-query.json"
+cat > "$QUERY_FILE" << 'QUERYEOF'
+{
+  "query": {
+    "match_all": {}
+  },
+  "_source": ["@timestamp", "message", "server.hostname", "k8s.namespace"]
+}
+QUERYEOF
+
+OUTFILE="$EXPORT_DIR/dotted-source-export.jsonl"
+run_export "_source dotted path filtering" \
+    --index "$INDEX_NAME" \
+    --query-file "$QUERY_FILE" \
+    -o "$OUTFILE" || true
+
+if [ -f "$OUTFILE" ]; then
+    LINE_COUNT=$(wc -l < "$OUTFILE" | tr -d ' ')
+    if [ "$LINE_COUNT" = "10" ]; then
+        ok "dotted _source filtering: got ${LINE_COUNT} lines (expected 10)"
+    else
+        fail "dotted _source filtering: got ${LINE_COUNT} lines (expected 10)"
+    fi
+    # Check that nested fields are present via dotted paths
+    FIRST_LINE=$(head -1 "$OUTFILE")
+    HAS_SERVER_HOSTNAME=$(echo "$FIRST_LINE" | jq '.server.hostname != null' 2>/dev/null || echo "false")
+    HAS_K8S_NAMESPACE=$(echo "$FIRST_LINE" | jq '.k8s.namespace != null' 2>/dev/null || echo "false")
+    HAS_TIMESTAMP=$(echo "$FIRST_LINE" | jq 'has("@timestamp")' 2>/dev/null || echo "false")
+    HAS_MESSAGE=$(echo "$FIRST_LINE" | jq 'has("message")' 2>/dev/null || echo "false")
+    # Fields NOT requested should be absent
+    HAS_LEVEL=$(echo "$FIRST_LINE" | jq 'has("level")' 2>/dev/null || echo "true")
+    HAS_SERVER_DC=$(echo "$FIRST_LINE" | jq '.server.dc != null' 2>/dev/null || echo "true")
+    HAS_K8S_POD=$(echo "$FIRST_LINE" | jq '.k8s.pod_name != null' 2>/dev/null || echo "true")
+
+    if [ "$HAS_SERVER_HOSTNAME" = "true" ] && [ "$HAS_K8S_NAMESPACE" = "true" ] && [ "$HAS_TIMESTAMP" = "true" ] && [ "$HAS_MESSAGE" = "true" ]; then
+        ok "dotted _source filtering: requested nested fields present (server.hostname, k8s.namespace)"
+    else
+        fail "dotted _source filtering: missing requested fields (server.hostname=$HAS_SERVER_HOSTNAME, k8s.namespace=$HAS_K8S_NAMESPACE, @timestamp=$HAS_TIMESTAMP, message=$HAS_MESSAGE)"
+        echo "    First line: $FIRST_LINE"
+    fi
+    if [ "$HAS_LEVEL" = "false" ] && [ "$HAS_SERVER_DC" = "false" ] && [ "$HAS_K8S_POD" = "false" ]; then
+        ok "dotted _source filtering: unrequested fields excluded (level, server.dc, k8s.pod_name)"
+    else
+        fail "dotted _source filtering: unrequested fields present (level=$HAS_LEVEL, server.dc=$HAS_SERVER_DC, k8s.pod_name=$HAS_K8S_POD)"
+        echo "    First line: $FIRST_LINE"
+    fi
+else
+    fail "dotted _source filtering: output file not created"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # List-snapshots and auto-discovery tests
 # ══════════════════════════════════════════════════════════════════════════════
@@ -756,7 +810,7 @@ else
     echo "    Output: $LIST_OUTPUT"
 fi
 
-# ── Export Test 8: auto-discover snapshot ─────────────────────────────────────
+# ── Export Test 9: auto-discover snapshot ─────────────────────────────────────
 
 OUTFILE="$EXPORT_DIR/auto-discover-export.jsonl"
 echo -e "\033[1;34m==>\033[0m Export test: auto-discover snapshot (no --snapshot)" >&2
@@ -777,7 +831,7 @@ else
     fail "auto-discover export: output file not created"
 fi
 
-# ── Export Test 9: auto-discover via alias ────────────────────────────────────
+# ── Export Test 10: auto-discover via alias ───────────────────────────────────
 
 OUTFILE="$EXPORT_DIR/auto-discover-alias-export.jsonl"
 echo -e "\033[1;34m==>\033[0m Export test: auto-discover snapshot via alias" >&2
@@ -810,7 +864,7 @@ else
     echo "    Output: $(echo "$LIST_JSON" | head -20)"
 fi
 
-# ── Export Test 10: export-range latest-per-index ────────────────────────────
+# ── Export Test 11: export-range latest-per-index ────────────────────────────
 
 RANGE_EXPORT_DIR="$EXPORT_DIR/export-range-latest"
 RANGE_PROFILE="$EXPORT_DIR/export-range-latest-profile.json"
@@ -853,7 +907,7 @@ else
     fail "export-range latest-per-index: profiling output missing or invalid"
 fi
 
-# ── Export Test 11: export-range interrupted still writes profile ────────────
+# ── Export Test 12: export-range interrupted still writes profile ────────────
 
 INTERRUPTED_PROFILE="$EXPORT_DIR/export-range-interrupted-profile.json"
 INTERRUPTED_EXPORT_DIR="$EXPORT_DIR/export-range-interrupted"
@@ -886,7 +940,7 @@ else
     fail "export-range interrupted: profiling output missing or invalid"
 fi
 
-# ── Export Test 12: export-range --all-snapshots ─────────────────────────────
+# ── Export Test 13: export-range --all-snapshots ─────────────────────────────
 
 RANGE_EXPORT_ALL_DIR="$EXPORT_DIR/export-range-all"
 mkdir -p "$RANGE_EXPORT_ALL_DIR"
