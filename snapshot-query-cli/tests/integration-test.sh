@@ -872,7 +872,7 @@ mkdir -p "$RANGE_EXPORT_DIR"
 echo -e "\033[1;34m==>\033[0m Export test: export-range latest-per-index" >&2
 "$JAVA" -jar "$JAR_PATH" export-range \
     "${S3_COMMON_ARGS[@]}" \
-    --index-pattern '.ds-logs-180-default-*' \
+    --index '.ds-logs-180-default-*' \
     --index-date-from 2024-01-15 \
     --index-date-to 2024-01-16 \
     --query '{"match_all":{}}' \
@@ -915,7 +915,7 @@ mkdir -p "$INTERRUPTED_EXPORT_DIR"
 echo -e "\033[1;34m==>\033[0m Export test: export-range interrupted writes profile" >&2
 "$JAVA" -jar "$JAR_PATH" export-range \
     "${S3_COMMON_ARGS[@]}" \
-    --index-pattern '.ds-logs-180-default-*' \
+    --index '.ds-logs-180-default-*' \
     --index-date-from 2024-01-15 \
     --index-date-to 2024-01-16 \
     --query '{"match_all":{}}' \
@@ -947,7 +947,7 @@ mkdir -p "$RANGE_EXPORT_ALL_DIR"
 echo -e "\033[1;34m==>\033[0m Export test: export-range --all-snapshots" >&2
 "$JAVA" -jar "$JAR_PATH" export-range \
     "${S3_COMMON_ARGS[@]}" \
-    --index-pattern '.ds-logs-180-default-*' \
+    --index '.ds-logs-180-default-*' \
     --index-date-from 2024-01-15 \
     --index-date-to 2024-01-16 \
     --query '{"match_all":{}}' \
@@ -967,6 +967,35 @@ if [ "$TOTAL_LINES" = "8" ]; then
     ok "export-range --all-snapshots: exported ${TOTAL_LINES} docs (expected 8)"
 else
     fail "export-range --all-snapshots: exported ${TOTAL_LINES} docs (expected 8)"
+fi
+
+# ── Export Test 14: export-range --parallel-indices ───────────────────────────
+
+RANGE_EXPORT_PAR_DIR="$EXPORT_DIR/export-range-parallel"
+mkdir -p "$RANGE_EXPORT_PAR_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: export-range --parallel-indices" >&2
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_PAR_DIR" \
+    --parallel-indices 3 2>/dev/null || true
+
+FILE_COUNT=$(find "$RANGE_EXPORT_PAR_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
+TOTAL_LINES=$(find "$RANGE_EXPORT_PAR_DIR" -name '*.jsonl' -exec cat {} \; | wc -l | tr -d ' ')
+if [ "$FILE_COUNT" = "3" ]; then
+    ok "export-range --parallel-indices: created ${FILE_COUNT} files (expected 3)"
+else
+    fail "export-range --parallel-indices: created ${FILE_COUNT} files (expected 3)"
+fi
+if [ "$TOTAL_LINES" = "6" ]; then
+    ok "export-range --parallel-indices: exported ${TOTAL_LINES} docs (expected 6)"
+else
+    fail "export-range --parallel-indices: exported ${TOTAL_LINES} docs (expected 6)"
 fi
 
 # ── Results ──────────────────────────────────────────────────────────────────

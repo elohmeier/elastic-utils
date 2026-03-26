@@ -16,17 +16,13 @@ final class ProfilingRecorder {
   private final long startedAtNanos = System.nanoTime();
   private volatile boolean partial;
   private volatile String exitReason = "running";
-  private volatile String currentSnapshotName;
-  private volatile String currentIndexName;
-  private volatile int currentShardId = -1;
-  private volatile int currentTotalShards;
   private volatile String currentStage = "starting";
   private volatile int completedTargets;
   private volatile int totalTargets;
-  private volatile long currentShardTotalHits = -1;
 
-  private final ConcurrentHashMap<Integer, String> activeShards = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<Integer, Long> activeShardHits = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, ActiveTarget> activeTargets = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, String> activeShards = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, Long> activeShardHits = new ConcurrentHashMap<>();
 
   private final Map<String, AtomicLong> phaseNanos = new ConcurrentHashMap<>();
   private final AtomicLong s3HeadCalls = new AtomicLong();
@@ -54,10 +50,8 @@ final class ProfilingRecorder {
   }
 
   void startTarget(String snapshotName, String indexName, int completedTargets, int totalTargets) {
-    currentSnapshotName = snapshotName;
-    currentIndexName = indexName;
-    currentShardId = -1;
-    currentStage = "resolving";
+    activeTargets.put(indexName, new ActiveTarget(snapshotName, indexName, "resolving"));
+    currentStage = "exporting";
     setTargetTotals(completedTargets, totalTargets);
   }
 
@@ -66,40 +60,67 @@ final class ProfilingRecorder {
   }
 
   void startShard(String indexName, int shardId, int totalShards, String stage) {
-    currentIndexName = indexName;
-    currentShardId = shardId;
-    currentTotalShards = totalShards;
-    currentStage = stage;
-    currentShardTotalHits = -1;
-    activateShard(shardId, stage);
+    ActiveTarget target = activeTargets.get(indexName);
+    if (target != null) {
+      target.stage = stage;
+      target.totalShards = totalShards;
+    }
+    activateShard(indexName, shardId, stage);
+  }
+
+  void activateShard(String indexName, int shardId, String stage) {
+    activeShards.put(shardKey(indexName, shardId), stage);
   }
 
   void activateShard(int shardId, String stage) {
-    activeShards.put(shardId, stage);
+    activeShards.put(Integer.toString(shardId), stage);
+  }
+
+  void updateShardStage(String indexName, int shardId, String stage) {
+    activeShards.replace(shardKey(indexName, shardId), stage);
   }
 
   void updateShardStage(int shardId, String stage) {
-    activeShards.replace(shardId, stage);
+    activeShards.replace(Integer.toString(shardId), stage);
+  }
+
+  void setShardTotalHits(String indexName, int shardId, long totalHits) {
+    activeShardHits.put(shardKey(indexName, shardId), totalHits);
   }
 
   void setShardTotalHits(int shardId, long totalHits) {
-    activeShardHits.put(shardId, totalHits);
+    activeShardHits.put(Integer.toString(shardId), totalHits);
+  }
+
+  void deactivateShard(String indexName, int shardId) {
+    activeShards.remove(shardKey(indexName, shardId));
+    activeShardHits.remove(shardKey(indexName, shardId));
   }
 
   void deactivateShard(int shardId) {
-    activeShards.remove(shardId);
-    activeShardHits.remove(shardId);
+    activeShards.remove(Integer.toString(shardId));
+    activeShardHits.remove(Integer.toString(shardId));
   }
 
   void setCurrentShardTotalHits(long totalHits) {
-    currentShardTotalHits = totalHits;
+    // no-op, kept for backward compat with single-index export
   }
 
   void finishTarget(int completedTargets, int totalTargets) {
     this.completedTargets = completedTargets;
     this.totalTargets = totalTargets;
-    currentShardId = -1;
-    currentStage = "idle";
+    if (activeTargets.isEmpty()) {
+      currentStage = "idle";
+    }
+  }
+
+  void finishTarget(String indexName, int completedTargets, int totalTargets) {
+    activeTargets.remove(indexName);
+    finishTarget(completedTargets, totalTargets);
+  }
+
+  private static String shardKey(String indexName, int shardId) {
+    return indexName + "#" + shardId;
   }
 
   void markCompleted() {
@@ -283,28 +304,12 @@ final class ProfilingRecorder {
     return liveDocsExported.get();
   }
 
-  String currentSnapshotName() {
-    return currentSnapshotName;
-  }
-
-  String currentIndexName() {
-    return currentIndexName;
-  }
-
-  int currentShardId() {
-    return currentShardId;
-  }
-
-  int currentTotalShards() {
-    return currentTotalShards;
-  }
-
-  long currentShardTotalHits() {
-    return currentShardTotalHits;
-  }
-
   String currentStage() {
     return currentStage;
+  }
+
+  int activeTargetCount() {
+    return activeTargets.size();
   }
 
   int completedTargets() {
@@ -360,6 +365,19 @@ final class ProfilingRecorder {
 
     private ShardStats(int shardId) {
       this.shardId = shardId;
+    }
+  }
+
+  static final class ActiveTarget {
+    final String snapshotName;
+    final String indexName;
+    volatile String stage;
+    volatile int totalShards;
+
+    ActiveTarget(String snapshotName, String indexName, String stage) {
+      this.snapshotName = snapshotName;
+      this.indexName = indexName;
+      this.stage = stage;
     }
   }
 

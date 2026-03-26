@@ -183,7 +183,7 @@ final class SnapshotExportSupport {
                 + elapsed
                 + "s)");
         if (profilingRecorder != null) {
-          profilingRecorder.deactivateShard(shardId);
+          profilingRecorder.deactivateShard(indexName, shardId);
         }
       }
     }
@@ -220,7 +220,7 @@ final class SnapshotExportSupport {
                     metadataLoader.shardContainer(resolved.indexId(), shardId);
                 BlobStoreIndexShardSnapshot blobStoreSnapshot = shardSnapshot.snapshot();
                 if (profilingRecorder != null) {
-                  profilingRecorder.activateShard(shardId, "opening");
+                  profilingRecorder.activateShard(indexName, shardId, "opening");
                   profilingRecorder.startShard(indexName, shardId, shardCount, "opening");
                 }
 
@@ -236,7 +236,7 @@ final class SnapshotExportSupport {
                   long openNanos = System.nanoTime() - openStartNanos;
                   if (profilingRecorder != null) {
                     profilingRecorder.recordShardOpen(indexName, shardId, openNanos);
-                    profilingRecorder.updateShardStage(shardId, "searching");
+                    profilingRecorder.updateShardStage(indexName, shardId, "searching");
                   }
                   IndexSearcher searcher = new IndexSearcher(reader);
                   long shardStartNanos = System.nanoTime();
@@ -270,7 +270,7 @@ final class SnapshotExportSupport {
                           + elapsed
                           + "s)");
                   if (profilingRecorder != null) {
-                    profilingRecorder.deactivateShard(shardId);
+                    profilingRecorder.deactivateShard(indexName, shardId);
                   }
                   return shardExported;
                 }
@@ -351,8 +351,7 @@ final class SnapshotExportSupport {
       }
 
       if (lastDoc == null && profilingRecorder != null && topDocs.totalHits != null) {
-        profilingRecorder.setCurrentShardTotalHits(topDocs.totalHits.value());
-        profilingRecorder.setShardTotalHits(shardId, topDocs.totalHits.value());
+        profilingRecorder.setShardTotalHits(indexName, shardId, topDocs.totalHits.value());
       }
 
       // Fetch stored fields (S3 reads happen here, outside the lock)

@@ -38,6 +38,7 @@ public class SnapshotMetadataLoader {
 
   private final BlobContainer rootContainer;
   private final S3ClientFactory.S3Access s3Access;
+  private volatile RepositoryData cachedRepositoryData;
 
   public SnapshotMetadataLoader(BlobContainer rootContainer, S3ClientFactory.S3Access s3Access) {
     this.rootContainer = rootContainer;
@@ -46,7 +47,7 @@ public class SnapshotMetadataLoader {
 
   /** Resolves snapshot name and index name to shard-level snapshot metadata. */
   public ResolvedIndex resolve(String snapshotName, String indexName) throws IOException {
-    RepositoryData repositoryData = loadRepositoryData();
+    RepositoryData repositoryData = getRepositoryData();
 
     // Find snapshot by name
     SnapshotId snapshotId = null;
@@ -95,6 +96,20 @@ public class SnapshotMetadataLoader {
     }
 
     return new ResolvedIndex(snapshotId, indexId, indexMetadata, shardSnapshots);
+  }
+
+  /**
+   * Returns cached repository data, loading it from S3 on first call. Thread-safe: concurrent
+   * callers may redundantly load but will converge on the same generation.
+   */
+  private RepositoryData getRepositoryData() throws IOException {
+    RepositoryData data = cachedRepositoryData;
+    if (data != null) {
+      return data;
+    }
+    data = loadRepositoryData();
+    cachedRepositoryData = data;
+    return data;
   }
 
   private RepositoryData loadRepositoryData() throws IOException {
@@ -151,7 +166,7 @@ public class SnapshotMetadataLoader {
    */
   public List<ResolvedIndex> resolveIndices(String snapshotName, String indexNameOrAlias)
       throws IOException {
-    RepositoryData repositoryData = loadRepositoryData();
+    RepositoryData repositoryData = getRepositoryData();
 
     SnapshotId snapshotId = null;
     for (SnapshotId id : repositoryData.getSnapshotIds()) {
@@ -270,7 +285,7 @@ public class SnapshotMetadataLoader {
 
   /** Lists all snapshots in the repository with their metadata. */
   public List<SnapshotSummary> listSnapshots() throws IOException {
-    RepositoryData repositoryData = loadRepositoryData();
+    RepositoryData repositoryData = getRepositoryData();
     List<SnapshotSummary> summaries = new ArrayList<>();
 
     for (SnapshotId snapshotId : repositoryData.getSnapshotIds()) {
@@ -306,7 +321,7 @@ public class SnapshotMetadataLoader {
   }
 
   public List<SnapshotSummary> listSnapshotsForIndex(String indexNameOrAlias) throws IOException {
-    RepositoryData repositoryData = loadRepositoryData();
+    RepositoryData repositoryData = getRepositoryData();
     var allIndices = repositoryData.getIndices();
     List<SnapshotSummary> matching = new ArrayList<>();
 

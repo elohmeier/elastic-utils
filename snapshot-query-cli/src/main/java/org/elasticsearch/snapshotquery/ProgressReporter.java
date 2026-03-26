@@ -32,18 +32,14 @@ final class ProgressReporter implements AutoCloseable {
                   return;
                 }
 
-                int activeCount = profilingRecorder.activeShardCount();
-                int shardId = profilingRecorder.currentShardId();
-                int totalShards = profilingRecorder.currentTotalShards();
-                String shardText;
-                if (activeCount > 1) {
-                  shardText = " " + activeCount + " shards active/" + totalShards;
-                } else if (shardId >= 0) {
-                  shardText = " shard " + (shardId + 1) + "/" + totalShards;
-                } else {
-                  shardText = "";
-                }
+                int activeShardCount = profilingRecorder.activeShardCount();
+                int activeTargetCount = profilingRecorder.activeTargetCount();
+                String shardText =
+                    activeShardCount > 0 ? " " + activeShardCount + " shards active" : "";
                 String stage = profilingRecorder.currentStage();
+                if (activeTargetCount > 1) {
+                  stage = activeTargetCount + " indices active";
+                }
                 long docs = profilingRecorder.totalDocsExported();
                 long s3Bytes = profilingRecorder.s3BytesRead();
                 long s3Calls =
@@ -51,15 +47,9 @@ final class ProgressReporter implements AutoCloseable {
                 long elapsedMs = profilingRecorder.totalMillis();
                 long elapsed = elapsedMs / 1000;
 
-                long totalHits;
-                if (activeCount > 1) {
-                  totalHits = profilingRecorder.activeShardsTotalHits();
-                } else {
-                  totalHits = profilingRecorder.currentShardTotalHits();
-                }
+                long totalHits = profilingRecorder.activeShardsTotalHits();
                 String hitsText = totalHits > 0 ? " (" + formatNumber(totalHits) + " hits)" : "";
 
-                double docsPerSec = elapsedMs > 0 ? docs * 1000.0 / elapsedMs : 0;
                 double bytesPerSec = elapsedMs > 0 ? s3Bytes * 1000.0 / elapsedMs : 0;
 
                 String line =

@@ -9,9 +9,16 @@ import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 import org.apache.lucene.search.Query;
@@ -28,7 +35,7 @@ import org.elasticsearch.core.SuppressForbidden;
 public class ExportRangeCli extends Command {
 
   private final S3Options s3Options;
-  private final OptionSpec<String> indexPatternOption;
+  private final OptionSpec<String> indexOption;
   private final OptionSpec<String> indexDateFromOption;
   private final OptionSpec<String> indexDateToOption;
   private final OptionSpec<String> queryFileOption;
@@ -41,13 +48,14 @@ public class ExportRangeCli extends Command {
   private final OptionSpec<Void> allSnapshotsOption;
   private final OptionSpec<String> profileFileOption;
   private final OptionSpec<Integer> parallelShardsOption;
+  private final OptionSpec<Integer> parallelIndicesOption;
 
   public ExportRangeCli() {
     super("Export many snapshot/index pairs for an index date range in a single JVM");
     s3Options = new S3Options(parser);
-    indexPatternOption =
+    indexOption =
         parser
-            .accepts("index-pattern", "Index wildcard pattern to export")
+            .acceptsAll(Arrays.asList("i", "index"), "Index name, alias, or pattern")
             .withRequiredArg()
             .required();
     indexDateFromOption =
@@ -76,7 +84,10 @@ public class ExportRangeCli extends Command {
             .accepts("to-date", "End date filter for @timestamp (exclusive, ISO date or datetime)")
             .withRequiredArg();
     outputDirOption =
-        parser.accepts("output-dir", "Directory for exported files").withRequiredArg().required();
+        parser
+            .acceptsAll(Arrays.asList("o", "output-dir"), "Directory for exported files")
+            .withRequiredArg()
+            .required();
     compressionOption =
         parser
             .accepts("compression", "Compression: none, zstd")
@@ -98,10 +109,16 @@ public class ExportRangeCli extends Command {
             .withRequiredArg();
     parallelShardsOption =
         parser
-            .accepts("parallel-shards", "Number of shards to export concurrently")
+            .accepts("parallel-shards", "Number of shards to export concurrently per index")
             .withRequiredArg()
             .ofType(Integer.class)
             .defaultsTo(3);
+    parallelIndicesOption =
+        parser
+            .accepts("parallel-indices", "Number of indices to export concurrently")
+            .withRequiredArg()
+            .ofType(Integer.class)
+            .defaultsTo(1);
   }
 
   @Override
@@ -109,7 +126,7 @@ public class ExportRangeCli extends Command {
       throws Exception {
     long startTime = System.currentTimeMillis();
 
-    String indexPattern = indexPatternOption.value(options);
+    String indexPattern = indexOption.value(options);
     String indexDateFrom = indexDateFromOption.value(options);
     String indexDateTo = indexDateToOption.value(options);
     String fromDate = options.has(fromDateOption) ? fromDateOption.value(options) : null;
@@ -119,6 +136,7 @@ public class ExportRangeCli extends Command {
     int batchSize = batchSizeOption.value(options);
     boolean allSnapshots = options.has(allSnapshotsOption);
     int parallelShards = parallelShardsOption.value(options);
+    int parallelIndices = parallelIndicesOption.value(options);
     String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
     ProfilingRecorder profilingRecorder = new ProfilingRecorder();
     ProfileFileWriter profileFileWriter = ProfileFileWriter.create(profileFile, profilingRecorder);
@@ -162,67 +180,210 @@ public class ExportRangeCli extends Command {
       }
 
       terminal.errorPrintln("Found " + targets.size() + " snapshot/index pairs to export");
-      long totalExported = 0;
-      int current = 0;
       profilingRecorder.setTargetTotals(0, targets.size());
+      AtomicLong totalExported = new AtomicLong();
+      AtomicInteger completed = new AtomicInteger();
 
-      for (SnapshotMetadataLoader.ExportTarget target : targets) {
-        current++;
-        profilingRecorder.startTarget(
-            target.snapshotName(), target.indexName(), current - 1, targets.size());
-        String outputPath = buildOutputPath(outputDir, target, compression, allSnapshots, targets);
-        progressReporter.clearLine();
-        terminal.errorPrintln(
-            "["
-                + current
-                + "/"
-                + targets.size()
-                + "] Exporting "
-                + target.indexName()
-                + " from "
-                + target.snapshotName()
-                + "...");
-
-        try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
-          long resolveStartNanos = System.nanoTime();
-          SnapshotMetadataLoader.ResolvedIndex resolved =
-              metadataLoader.resolve(target.snapshotName(), target.indexName());
-          profilingRecorder.recordIndexResolve(
-              target.indexName(), target.snapshotName(), System.nanoTime() - resolveStartNanos);
-          long exportStartNanos = System.nanoTime();
-          long exported =
-              SnapshotExportSupport.exportResolvedIndex(
-                  terminal,
-                  metadataLoader,
-                  resolved,
-                  luceneQuery,
-                  sort,
-                  sourceFields,
-                  batchSize,
-                  out,
-                  startTime,
-                  profilingRecorder,
-                  progressReporter,
-                  parallelShards);
-          out.flush();
-          profilingRecorder.recordIndexExport(
-              target.indexName(),
-              target.snapshotName(),
-              outputPath,
-              exported,
-              System.nanoTime() - exportStartNanos);
-          totalExported += exported;
-          profilingRecorder.finishTarget(current, targets.size());
+      if (parallelIndices > 1 && targets.size() > 1) {
+        exportIndicesParallel(
+            terminal,
+            metadataLoader,
+            targets,
+            luceneQuery,
+            sort,
+            sourceFields,
+            batchSize,
+            outputDir,
+            compression,
+            allSnapshots,
+            startTime,
+            profilingRecorder,
+            progressReporter,
+            parallelShards,
+            parallelIndices,
+            totalExported,
+            completed);
+      } else {
+        for (SnapshotMetadataLoader.ExportTarget target : targets) {
+          int current = completed.get() + 1;
+          profilingRecorder.startTarget(
+              target.snapshotName(), target.indexName(), current - 1, targets.size());
+          String outputPath =
+              buildOutputPath(outputDir, target, compression, allSnapshots, targets);
           progressReporter.clearLine();
-          terminal.errorPrintln("  Index complete: " + exported + " docs -> " + outputPath);
+          terminal.errorPrintln(
+              "["
+                  + current
+                  + "/"
+                  + targets.size()
+                  + "] Exporting "
+                  + target.indexName()
+                  + " from "
+                  + target.snapshotName()
+                  + "...");
+
+          try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
+            long resolveStartNanos = System.nanoTime();
+            SnapshotMetadataLoader.ResolvedIndex resolved =
+                metadataLoader.resolve(target.snapshotName(), target.indexName());
+            profilingRecorder.recordIndexResolve(
+                target.indexName(), target.snapshotName(), System.nanoTime() - resolveStartNanos);
+            long exportStartNanos = System.nanoTime();
+            long exported =
+                SnapshotExportSupport.exportResolvedIndex(
+                    terminal,
+                    metadataLoader,
+                    resolved,
+                    luceneQuery,
+                    sort,
+                    sourceFields,
+                    batchSize,
+                    out,
+                    startTime,
+                    profilingRecorder,
+                    progressReporter,
+                    parallelShards);
+            out.flush();
+            profilingRecorder.recordIndexExport(
+                target.indexName(),
+                target.snapshotName(),
+                outputPath,
+                exported,
+                System.nanoTime() - exportStartNanos);
+            totalExported.addAndGet(exported);
+            int done = completed.incrementAndGet();
+            profilingRecorder.finishTarget(target.indexName(), done, targets.size());
+            progressReporter.clearLine();
+            terminal.errorPrintln("  Index complete: " + exported + " docs -> " + outputPath);
+          }
         }
       }
 
       long tookMs = System.currentTimeMillis() - startTime;
       progressReporter.clearLine();
       terminal.errorPrintln(
-          "Export-range complete: " + totalExported + " documents in " + (tookMs / 1000) + "s");
+          "Export-range complete: "
+              + totalExported.get()
+              + " documents in "
+              + (tookMs / 1000)
+              + "s");
       profileFileWriter.flushCompleted();
+    }
+  }
+
+  private static void exportIndicesParallel(
+      Terminal terminal,
+      SnapshotMetadataLoader metadataLoader,
+      List<SnapshotMetadataLoader.ExportTarget> targets,
+      Query luceneQuery,
+      Sort sort,
+      List<String> sourceFields,
+      int batchSize,
+      String outputDir,
+      String compression,
+      boolean allSnapshots,
+      long startTimeMillis,
+      ProfilingRecorder profilingRecorder,
+      ProgressReporter progressReporter,
+      int parallelShards,
+      int parallelIndices,
+      AtomicLong totalExported,
+      AtomicInteger completed)
+      throws IOException {
+    ExecutorService executor =
+        Executors.newFixedThreadPool(
+            parallelIndices,
+            r -> {
+              Thread t = new Thread(r, "index-export");
+              t.setDaemon(true);
+              return t;
+            });
+
+    List<Future<Void>> futures = new ArrayList<>();
+    for (SnapshotMetadataLoader.ExportTarget target : targets) {
+      futures.add(
+          executor.submit(
+              () -> {
+                int current = completed.get() + 1;
+                profilingRecorder.startTarget(
+                    target.snapshotName(), target.indexName(), current - 1, targets.size());
+                String outputPath =
+                    buildOutputPath(outputDir, target, compression, allSnapshots, targets);
+                progressReporter.clearLine();
+                terminal.errorPrintln(
+                    "["
+                        + current
+                        + "/"
+                        + targets.size()
+                        + "] Exporting "
+                        + target.indexName()
+                        + " from "
+                        + target.snapshotName()
+                        + "...");
+
+                try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
+                  long resolveStartNanos = System.nanoTime();
+                  SnapshotMetadataLoader.ResolvedIndex resolved =
+                      metadataLoader.resolve(target.snapshotName(), target.indexName());
+                  profilingRecorder.recordIndexResolve(
+                      target.indexName(),
+                      target.snapshotName(),
+                      System.nanoTime() - resolveStartNanos);
+                  long exportStartNanos = System.nanoTime();
+                  long exported =
+                      SnapshotExportSupport.exportResolvedIndex(
+                          terminal,
+                          metadataLoader,
+                          resolved,
+                          luceneQuery,
+                          sort,
+                          sourceFields,
+                          batchSize,
+                          out,
+                          startTimeMillis,
+                          profilingRecorder,
+                          progressReporter,
+                          parallelShards);
+                  out.flush();
+                  profilingRecorder.recordIndexExport(
+                      target.indexName(),
+                      target.snapshotName(),
+                      outputPath,
+                      exported,
+                      System.nanoTime() - exportStartNanos);
+                  totalExported.addAndGet(exported);
+                  int done = completed.incrementAndGet();
+                  profilingRecorder.finishTarget(target.indexName(), done, targets.size());
+                  progressReporter.clearLine();
+                  terminal.errorPrintln("  Index complete: " + exported + " docs -> " + outputPath);
+                }
+                return null;
+              }));
+    }
+
+    executor.shutdown();
+    IOException failure = null;
+    for (Future<Void> future : futures) {
+      try {
+        future.get();
+      } catch (ExecutionException e) {
+        executor.shutdownNow();
+        Throwable cause = e.getCause();
+        if (cause instanceof IOException ioe) {
+          failure = ioe;
+        } else {
+          failure = new IOException("Index export failed", cause);
+        }
+        break;
+      } catch (InterruptedException e) {
+        executor.shutdownNow();
+        Thread.currentThread().interrupt();
+        failure = new IOException("Index export interrupted", e);
+        break;
+      }
+    }
+    if (failure != null) {
+      throw failure;
     }
   }
 
