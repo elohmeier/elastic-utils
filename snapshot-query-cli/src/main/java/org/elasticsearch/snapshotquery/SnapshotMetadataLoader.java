@@ -75,15 +75,14 @@ public class SnapshotMetadataLoader {
               + repositoryData.getIndices().keySet());
     }
 
-    // Load index metadata to get shard count
+    // Load shard count (uses lenient parser that skips rollover_info etc.)
     String metaBlobId =
         repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
     BlobContainer indexContainer = indexContainer(indexId);
-    IndexMetadata indexMetadata =
-        BlobStoreRepository.INDEX_METADATA_FORMAT.read(
-            DUMMY_REPO, indexContainer, metaBlobId, NamedXContentRegistry.EMPTY);
-
-    int shardCount = indexMetadata.getNumberOfShards();
+    int shardCount =
+        BlobStoreRepository.INDEX_SHARD_COUNT_FORMAT
+            .read(DUMMY_REPO, indexContainer, metaBlobId, NamedXContentRegistry.EMPTY)
+            .count();
 
     // Load shard snapshots
     List<ShardSnapshot> shardSnapshots = new ArrayList<>(shardCount);
@@ -95,7 +94,7 @@ public class SnapshotMetadataLoader {
       shardSnapshots.add(new ShardSnapshot(shard, shardSnapshot));
     }
 
-    return new ResolvedIndex(snapshotId, indexId, indexMetadata, shardSnapshots);
+    return new ResolvedIndex(snapshotId, indexId, shardSnapshots);
   }
 
   /**
@@ -261,11 +260,11 @@ public class SnapshotMetadataLoader {
     String metaBlobId =
         repositoryData.indexMetaDataGenerations().indexMetaBlobId(snapshotId, indexId);
     BlobContainer idxContainer = indexContainer(indexId);
-    IndexMetadata indexMetadata =
-        BlobStoreRepository.INDEX_METADATA_FORMAT.read(
-            null, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY);
+    int shardCount =
+        BlobStoreRepository.INDEX_SHARD_COUNT_FORMAT
+            .read(DUMMY_REPO, idxContainer, metaBlobId, NamedXContentRegistry.EMPTY)
+            .count();
 
-    int shardCount = indexMetadata.getNumberOfShards();
     List<ShardSnapshot> shardSnapshots = new ArrayList<>(shardCount);
     for (int shard = 0; shard < shardCount; shard++) {
       BlobContainer shardCont = shardContainer(indexId, shard);
@@ -275,7 +274,7 @@ public class SnapshotMetadataLoader {
       shardSnapshots.add(new ShardSnapshot(shard, shardSnapshot));
     }
 
-    return new ResolvedIndex(snapshotId, indexId, indexMetadata, shardSnapshots);
+    return new ResolvedIndex(snapshotId, indexId, shardSnapshots);
   }
 
   private static boolean wildcardMatch(String text, String pattern) {
@@ -446,10 +445,7 @@ public class SnapshotMetadataLoader {
   public record ShardSnapshot(int shardId, BlobStoreIndexShardSnapshot snapshot) {}
 
   public record ResolvedIndex(
-      SnapshotId snapshotId,
-      IndexId indexId,
-      IndexMetadata indexMetadata,
-      List<ShardSnapshot> shardSnapshots) {}
+      SnapshotId snapshotId, IndexId indexId, List<ShardSnapshot> shardSnapshots) {}
 
   public record SnapshotSummary(
       SnapshotId snapshotId,
