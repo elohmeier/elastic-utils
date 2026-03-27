@@ -998,6 +998,147 @@ else
     fail "export-range --parallel-indices: exported ${TOTAL_LINES} docs (expected 6)"
 fi
 
+# ── Export Test 15: export-range atomic writes (no .tmp files after success) ─
+
+RANGE_EXPORT_ATOMIC_DIR="$EXPORT_DIR/export-range-atomic"
+mkdir -p "$RANGE_EXPORT_ATOMIC_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: export-range atomic writes" >&2
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_ATOMIC_DIR" 2>/dev/null || true
+
+TMP_COUNT=$(find "$RANGE_EXPORT_ATOMIC_DIR" -name '*.tmp' | wc -l | tr -d ' ')
+FILE_COUNT=$(find "$RANGE_EXPORT_ATOMIC_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
+if [ "$TMP_COUNT" = "0" ]; then
+    ok "atomic writes: no .tmp files left after successful export"
+else
+    fail "atomic writes: found ${TMP_COUNT} leftover .tmp files"
+fi
+if [ "$FILE_COUNT" = "3" ]; then
+    ok "atomic writes: created ${FILE_COUNT} final files (expected 3)"
+else
+    fail "atomic writes: created ${FILE_COUNT} final files (expected 3)"
+fi
+
+# ── Export Test 16: export-range --resume skips already-exported files ─────
+
+echo -e "\033[1;34m==>\033[0m Export test: export-range --resume" >&2
+# Capture timestamps of existing files
+BEFORE_TIMESTAMPS=$(find "$RANGE_EXPORT_ATOMIC_DIR" -name '*.jsonl' -exec stat -f '%m %N' {} \; | sort)
+
+RESUME_STDERR=$("$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_ATOMIC_DIR" \
+    --resume 2>&1 >/dev/null) || true
+
+SKIP_COUNT=$(echo "$RESUME_STDERR" | grep -c "Skipping" || true)
+if [ "$SKIP_COUNT" = "3" ]; then
+    ok "resume: skipped ${SKIP_COUNT} already-exported indices (expected 3)"
+else
+    fail "resume: skipped ${SKIP_COUNT} indices (expected 3)"
+    echo "    Stderr: $RESUME_STDERR"
+fi
+
+AFTER_TIMESTAMPS=$(find "$RANGE_EXPORT_ATOMIC_DIR" -name '*.jsonl' -exec stat -f '%m %N' {} \; | sort)
+if [ "$BEFORE_TIMESTAMPS" = "$AFTER_TIMESTAMPS" ]; then
+    ok "resume: files were not modified (timestamps unchanged)"
+else
+    fail "resume: files were modified during resume"
+fi
+
+# ── Export Test 17: export-range --resume completes partial export ─────────
+
+RANGE_EXPORT_PARTIAL_DIR="$EXPORT_DIR/export-range-partial"
+mkdir -p "$RANGE_EXPORT_PARTIAL_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: export-range --resume partial completion" >&2
+
+# Pre-create one file to simulate a completed export
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index '.ds-logs-180-default-2024.01.15*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-15 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_PARTIAL_DIR" 2>/dev/null || true
+
+PRE_FILE_COUNT=$(find "$RANGE_EXPORT_PARTIAL_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
+
+# Now run full range with --resume — should only export the missing indices
+RESUME_STDERR=$("$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-16 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_PARTIAL_DIR" \
+    --resume 2>&1 >/dev/null) || true
+
+POST_FILE_COUNT=$(find "$RANGE_EXPORT_PARTIAL_DIR" -name '*.jsonl' | wc -l | tr -d ' ')
+TOTAL_LINES=$(find "$RANGE_EXPORT_PARTIAL_DIR" -name '*.jsonl' -exec cat {} \; | wc -l | tr -d ' ')
+
+SKIP_COUNT=$(echo "$RESUME_STDERR" | grep -c "Skipping" || true)
+EXPORT_COUNT=$(echo "$RESUME_STDERR" | grep -c "Exporting" || true)
+
+if [ "$POST_FILE_COUNT" = "3" ]; then
+    ok "resume partial: ended with ${POST_FILE_COUNT} files (expected 3)"
+else
+    fail "resume partial: ended with ${POST_FILE_COUNT} files (expected 3)"
+fi
+if [ "$SKIP_COUNT" -ge 1 ]; then
+    ok "resume partial: skipped ${SKIP_COUNT} pre-existing index(es)"
+else
+    fail "resume partial: did not skip any indices"
+fi
+if [ "$TOTAL_LINES" = "6" ]; then
+    ok "resume partial: total ${TOTAL_LINES} docs across all files (expected 6)"
+else
+    fail "resume partial: total ${TOTAL_LINES} docs (expected 6)"
+fi
+
+# ── Export Test 18: --resume cleans up stale .tmp files ───────────────────
+
+RANGE_EXPORT_CLEANUP_DIR="$EXPORT_DIR/export-range-cleanup"
+mkdir -p "$RANGE_EXPORT_CLEANUP_DIR"
+echo -e "\033[1;34m==>\033[0m Export test: --resume cleans up stale .tmp files" >&2
+
+# Create fake stale .tmp files
+touch "$RANGE_EXPORT_CLEANUP_DIR/stale-index.jsonl.tmp"
+touch "$RANGE_EXPORT_CLEANUP_DIR/another-stale.jsonl.zst.tmp"
+
+"$JAVA" -jar "$JAR_PATH" export-range \
+    "${S3_COMMON_ARGS[@]}" \
+    --index '.ds-logs-180-default-*' \
+    --index-date-from 2024-01-15 \
+    --index-date-to 2024-01-15 \
+    --query '{"match_all":{}}' \
+    --from-date 2024-01-15 \
+    --to-date 2024-01-17 \
+    --output-dir "$RANGE_EXPORT_CLEANUP_DIR" \
+    --resume 2>/dev/null || true
+
+TMP_COUNT=$(find "$RANGE_EXPORT_CLEANUP_DIR" -name '*.tmp' | wc -l | tr -d ' ')
+if [ "$TMP_COUNT" = "0" ]; then
+    ok "resume cleanup: stale .tmp files were deleted"
+else
+    fail "resume cleanup: ${TMP_COUNT} .tmp files remain"
+fi
+
 # ── Results ──────────────────────────────────────────────────────────────────
 
 log ""

@@ -2,10 +2,14 @@ package org.elasticsearch.snapshotquery;
 
 import com.github.luben.zstd.ZstdOutputStream;
 import java.io.BufferedOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -319,6 +323,59 @@ final class SnapshotExportSupport {
       case "none", "" -> base;
       default -> throw new IllegalArgumentException("Unsupported compression: " + compression);
     };
+  }
+
+  @SuppressForbidden(reason = "file output for cli")
+  static AtomicFileOutput openAtomicOutput(String finalPath, String compression)
+      throws IOException {
+    String tempPath = finalPath + ".tmp";
+    OutputStream out = openOutput(tempPath, compression);
+    return new AtomicFileOutput(out, PathUtils.get(tempPath), PathUtils.get(finalPath));
+  }
+
+  static final class AtomicFileOutput implements Closeable {
+    private final OutputStream out;
+    private final Path tempPath;
+    private final Path finalPath;
+    private boolean committed = false;
+
+    AtomicFileOutput(OutputStream out, Path tempPath, Path finalPath) {
+      this.out = out;
+      this.tempPath = tempPath;
+      this.finalPath = finalPath;
+    }
+
+    OutputStream stream() {
+      return out;
+    }
+
+    @SuppressForbidden(reason = "atomic rename for cli")
+    void commit() throws IOException {
+      out.flush();
+      out.close();
+      try {
+        Files.move(
+            tempPath,
+            finalPath,
+            StandardCopyOption.REPLACE_EXISTING,
+            StandardCopyOption.ATOMIC_MOVE);
+      } catch (AtomicMoveNotSupportedException e) {
+        Files.move(tempPath, finalPath, StandardCopyOption.REPLACE_EXISTING);
+      }
+      committed = true;
+    }
+
+    @Override
+    @SuppressForbidden(reason = "cleanup temp file for cli")
+    public void close() throws IOException {
+      if (!committed) {
+        try {
+          out.close();
+        } catch (IOException ignored) {
+        }
+        Files.deleteIfExists(tempPath);
+      }
+    }
   }
 
   static long exportShard(

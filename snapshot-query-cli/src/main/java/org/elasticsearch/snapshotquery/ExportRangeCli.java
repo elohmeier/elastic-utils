@@ -1,7 +1,6 @@
 package org.elasticsearch.snapshotquery;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -19,6 +18,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 import joptsimple.OptionSet;
 import joptsimple.OptionSpec;
 import org.apache.lucene.search.Query;
@@ -49,6 +49,7 @@ public class ExportRangeCli extends Command {
   private final OptionSpec<String> profileFileOption;
   private final OptionSpec<Integer> parallelShardsOption;
   private final OptionSpec<Integer> parallelIndicesOption;
+  private final OptionSpec<Void> resumeOption;
 
   public ExportRangeCli() {
     super("Export many snapshot/index pairs for an index date range in a single JVM");
@@ -119,6 +120,10 @@ public class ExportRangeCli extends Command {
             .withRequiredArg()
             .ofType(Integer.class)
             .defaultsTo(1);
+    resumeOption =
+        parser.accepts(
+            "resume",
+            "Skip indices whose output file already exists (for resuming interrupted exports)");
   }
 
   @Override
@@ -137,6 +142,7 @@ public class ExportRangeCli extends Command {
     boolean allSnapshots = options.has(allSnapshotsOption);
     int parallelShards = parallelShardsOption.value(options);
     int parallelIndices = parallelIndicesOption.value(options);
+    boolean resume = options.has(resumeOption);
     String profileFile = options.has(profileFileOption) ? profileFileOption.value(options) : null;
     ProfilingRecorder profilingRecorder = new ProfilingRecorder();
     ProfileFileWriter profileFileWriter = ProfileFileWriter.create(profileFile, profilingRecorder);
@@ -157,6 +163,9 @@ public class ExportRangeCli extends Command {
     }
 
     ensureDirectory(outputDir);
+    if (resume) {
+      cleanupTempFiles(outputDir);
+    }
 
     terminal.errorPrintln("Connecting to S3 bucket: " + s3Options.bucket(options));
     long connectStartNanos = System.nanoTime();
@@ -201,15 +210,31 @@ public class ExportRangeCli extends Command {
             progressReporter,
             parallelShards,
             parallelIndices,
+            resume,
             totalExported,
             completed);
       } else {
         for (SnapshotMetadataLoader.ExportTarget target : targets) {
           int current = completed.get() + 1;
-          profilingRecorder.startTarget(
-              target.snapshotName(), target.indexName(), current - 1, targets.size());
           String outputPath =
               buildOutputPath(outputDir, target, compression, allSnapshots, targets);
+
+          if (resume && isAlreadyExported(outputPath)) {
+            progressReporter.clearLine();
+            terminal.errorPrintln(
+                "["
+                    + current
+                    + "/"
+                    + targets.size()
+                    + "] Skipping "
+                    + target.indexName()
+                    + " (already exported)");
+            completed.incrementAndGet();
+            continue;
+          }
+
+          profilingRecorder.startTarget(
+              target.snapshotName(), target.indexName(), current - 1, targets.size());
           progressReporter.clearLine();
           terminal.errorPrintln(
               "["
@@ -222,7 +247,8 @@ public class ExportRangeCli extends Command {
                   + target.snapshotName()
                   + "...");
 
-          try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
+          try (SnapshotExportSupport.AtomicFileOutput atomicOut =
+              SnapshotExportSupport.openAtomicOutput(outputPath, compression)) {
             long resolveStartNanos = System.nanoTime();
             SnapshotMetadataLoader.ResolvedIndex resolved =
                 metadataLoader.resolve(target.snapshotName(), target.indexName());
@@ -238,12 +264,12 @@ public class ExportRangeCli extends Command {
                     sort,
                     sourceFields,
                     batchSize,
-                    out,
+                    atomicOut.stream(),
                     startTime,
                     profilingRecorder,
                     progressReporter,
                     parallelShards);
-            out.flush();
+            atomicOut.commit();
             profilingRecorder.recordIndexExport(
                 target.indexName(),
                 target.snapshotName(),
@@ -287,6 +313,7 @@ public class ExportRangeCli extends Command {
       ProgressReporter progressReporter,
       int parallelShards,
       int parallelIndices,
+      boolean resume,
       AtomicLong totalExported,
       AtomicInteger completed)
       throws IOException {
@@ -305,10 +332,25 @@ public class ExportRangeCli extends Command {
           executor.submit(
               () -> {
                 int current = completed.get() + 1;
-                profilingRecorder.startTarget(
-                    target.snapshotName(), target.indexName(), current - 1, targets.size());
                 String outputPath =
                     buildOutputPath(outputDir, target, compression, allSnapshots, targets);
+
+                if (resume && isAlreadyExported(outputPath)) {
+                  progressReporter.clearLine();
+                  terminal.errorPrintln(
+                      "["
+                          + current
+                          + "/"
+                          + targets.size()
+                          + "] Skipping "
+                          + target.indexName()
+                          + " (already exported)");
+                  completed.incrementAndGet();
+                  return null;
+                }
+
+                profilingRecorder.startTarget(
+                    target.snapshotName(), target.indexName(), current - 1, targets.size());
                 progressReporter.clearLine();
                 terminal.errorPrintln(
                     "["
@@ -321,7 +363,8 @@ public class ExportRangeCli extends Command {
                         + target.snapshotName()
                         + "...");
 
-                try (OutputStream out = SnapshotExportSupport.openOutput(outputPath, compression)) {
+                try (SnapshotExportSupport.AtomicFileOutput atomicOut =
+                    SnapshotExportSupport.openAtomicOutput(outputPath, compression)) {
                   long resolveStartNanos = System.nanoTime();
                   SnapshotMetadataLoader.ResolvedIndex resolved =
                       metadataLoader.resolve(target.snapshotName(), target.indexName());
@@ -339,12 +382,12 @@ public class ExportRangeCli extends Command {
                           sort,
                           sourceFields,
                           batchSize,
-                          out,
+                          atomicOut.stream(),
                           startTimeMillis,
                           profilingRecorder,
                           progressReporter,
                           parallelShards);
-                  out.flush();
+                  atomicOut.commit();
                   profilingRecorder.recordIndexExport(
                       target.indexName(),
                       target.snapshotName(),
@@ -435,6 +478,31 @@ public class ExportRangeCli extends Command {
   @SuppressForbidden(reason = "file arg for cli")
   private static String readFile(String path) throws IOException {
     return Files.readString(PathUtils.get(path));
+  }
+
+  @SuppressForbidden(reason = "check output file for resume")
+  private static boolean isAlreadyExported(String path) throws IOException {
+    Path p = PathUtils.get(path);
+    return Files.exists(p) && Files.size(p) > 0;
+  }
+
+  @SuppressForbidden(reason = "cleanup temp files for resume")
+  private static void cleanupTempFiles(String outputDir) throws IOException {
+    Path dir = PathUtils.get(outputDir);
+    if (!Files.isDirectory(dir)) {
+      return;
+    }
+    try (Stream<Path> stream = Files.list(dir)) {
+      stream
+          .filter(p -> p.toString().endsWith(".tmp"))
+          .forEach(
+              p -> {
+                try {
+                  Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                }
+              });
+    }
   }
 
   @SuppressForbidden(reason = "create output directory for cli")
