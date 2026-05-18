@@ -26,6 +26,26 @@ elastic-utils auth login --url https://localhost:9200 --username elastic --passw
 
 # Preferred: verify with a custom CA bundle
 elastic-utils auth login --url https://localhost:9200 --username elastic --password secret --ca-cert /path/to/ca.pem
+
+# Custom API key expiration (default 90d). Use "never" for no expiration.
+elastic-utils auth login --expiration 30d
+elastic-utils auth login --expiration never
+```
+
+### Create an API key without storing it
+
+Use `auth create-key` to mint an API key and print it to stdout. Useful for
+provisioning keys for other tools or scripts. Credentials are not saved.
+
+```bash
+# Print key as text (default: never expires)
+elastic-utils auth create-key --url https://localhost:9200 --username elastic --password secret
+
+# Time-limited key
+elastic-utils auth create-key --name ingest-job --expiration 7d
+
+# Machine-readable output
+elastic-utils auth create-key --output json
 ```
 
 ## Async Search Commands

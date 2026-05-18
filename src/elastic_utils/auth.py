@@ -1,6 +1,7 @@
 """Authentication commands for Elasticsearch."""
 
 from pathlib import Path
+from typing import Any
 
 import click
 import httpx
@@ -16,6 +17,8 @@ from .config import (
 from .models import ApiKeyResponse
 
 console = Console()
+
+NEVER_EXPIRE = "never"
 
 
 def _handle_http_error(
@@ -35,6 +38,55 @@ def _handle_http_error(
     raise SystemExit(1)
 
 
+def _resolve_tls_verify(insecure: bool, ca_cert: Path | None) -> bool | str:
+    """Resolve TLS verification setting from CLI flags."""
+    if insecure and ca_cert:
+        console.print("[red]Use either --insecure or --ca-cert, not both.[/red]")
+        raise SystemExit(1)
+    if insecure:
+        return False
+    if ca_cert:
+        return str(ca_cert)
+    return True
+
+
+def create_api_key(
+    url: str,
+    username: str,
+    password: str,
+    name: str,
+    expiration: str | None,
+    tls_verify: bool | str,
+) -> ApiKeyResponse:
+    """Create an Elasticsearch API key.
+
+    Pass ``expiration=None`` (or the sentinel ``"never"``) to create a key
+    that never expires.
+    """
+    body: dict[str, Any] = {"name": name}
+    if expiration is not None and expiration != NEVER_EXPIRE:
+        body["expiration"] = expiration
+
+    try:
+        response = httpx.post(
+            f"{url}/_security/api_key",
+            auth=(username, password),
+            json=body,
+            timeout=30.0,
+            verify=tls_verify,
+        )
+        response.raise_for_status()
+    except httpx.ConnectError as e:
+        console.print(f"[red]Connection error:[/red] {e}")
+        raise SystemExit(1) from e
+    except httpx.HTTPStatusError as e:
+        _handle_http_error(
+            e, {401: "Authentication failed: Invalid username or password"}
+        )
+
+    return ApiKeyResponse.model_validate(response.json())
+
+
 @click.group()
 def auth() -> None:
     """Manage Elasticsearch authentication."""
@@ -51,6 +103,21 @@ def auth() -> None:
     help="Elasticsearch password",
 )
 @click.option(
+    "--expiration",
+    default="90d",
+    show_default=True,
+    help=(
+        "API key expiration (e.g. '30d', '12h'). "
+        f"Use '{NEVER_EXPIRE}' to create a key that never expires."
+    ),
+)
+@click.option(
+    "--name",
+    default="elastic-utils-cli",
+    show_default=True,
+    help="API key name.",
+)
+@click.option(
     "--insecure",
     is_flag=True,
     help="Disable TLS certificate verification (for self-signed/local clusters).",
@@ -64,48 +131,98 @@ def login(
     url: str,
     username: str,
     password: str,
+    expiration: str,
+    name: str,
     insecure: bool,
     ca_cert: Path | None,
 ) -> None:
     """Authenticate with Elasticsearch and store an API key."""
-    if insecure and ca_cert:
-        console.print("[red]Use either --insecure or --ca-cert, not both.[/red]")
-        raise SystemExit(1)
-
+    tls_verify = _resolve_tls_verify(insecure, ca_cert)
     url = url.rstrip("/")
-    tls_verify: bool | str = True
-    if insecure:
-        tls_verify = False
-    elif ca_cert:
-        tls_verify = str(ca_cert)
 
     console.print(f"Authenticating with [bold]{url}[/bold]...")
 
-    try:
-        response = httpx.post(
-            f"{url}/_security/api_key",
-            auth=(username, password),
-            json={
-                "name": "elastic-utils-cli",
-                "expiration": "90d",
-            },
-            timeout=30.0,
-            verify=tls_verify,
-        )
-        response.raise_for_status()
-    except httpx.ConnectError as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as e:
-        _handle_http_error(
-            e, {401: "Authentication failed: Invalid username or password"}
-        )
-
-    data = ApiKeyResponse.model_validate(response.json())
+    data = create_api_key(url, username, password, name, expiration, tls_verify)
 
     creds_path = save_credentials(url, data.id, data.api_key, tls_verify=tls_verify)
     console.print("[green]Successfully authenticated![/green]")
     console.print(f"API key stored at: {creds_path}")
+    if expiration == NEVER_EXPIRE:
+        console.print("Expiration: [yellow]never[/yellow]")
+    else:
+        console.print(f"Expiration: {expiration}")
+
+
+@auth.command("create-key")
+@click.option("--url", prompt="Elasticsearch URL", help="Elasticsearch server URL")
+@click.option("--username", prompt="Username", help="Elasticsearch username")
+@click.option(
+    "--password",
+    prompt="Password",
+    hide_input=True,
+    help="Elasticsearch password",
+)
+@click.option(
+    "--name",
+    default="elastic-utils-cli",
+    show_default=True,
+    help="API key name.",
+)
+@click.option(
+    "--expiration",
+    default=NEVER_EXPIRE,
+    show_default=True,
+    help=(
+        "API key expiration (e.g. '30d', '12h'). "
+        f"Use '{NEVER_EXPIRE}' to create a key that never expires."
+    ),
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--insecure",
+    is_flag=True,
+    help="Disable TLS certificate verification (for self-signed/local clusters).",
+)
+@click.option(
+    "--ca-cert",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to CA certificate bundle for TLS verification.",
+)
+def create_key(
+    url: str,
+    username: str,
+    password: str,
+    name: str,
+    expiration: str,
+    output_format: str,
+    insecure: bool,
+    ca_cert: Path | None,
+) -> None:
+    """Create an API key and print it to stdout without storing credentials."""
+    tls_verify = _resolve_tls_verify(insecure, ca_cert)
+    url = url.rstrip("/")
+
+    data = create_api_key(url, username, password, name, expiration, tls_verify)
+
+    if output_format == "json":
+        click.echo(data.model_dump_json())
+        return
+
+    console.print(f"[bold]ID:[/bold]       {data.id}")
+    console.print(f"[bold]Name:[/bold]     {data.name}")
+    console.print(f"[bold]API key:[/bold]  {data.api_key}")
+    console.print(f"[bold]Encoded:[/bold]  {data.encoded}")
+    if data.expiration is None:
+        console.print("[bold]Expires:[/bold]  [yellow]never[/yellow]")
+    else:
+        console.print(f"[bold]Expires:[/bold]  {data.expiration} (epoch ms)")
 
 
 @auth.command()
